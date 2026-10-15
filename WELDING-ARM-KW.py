@@ -19,7 +19,10 @@ import base64
 from datetime import datetime, timedelta
 from collections import Counter
 
+import math
 import re as _re
+import numpy as np
+import altair as alt
 import streamlit as st
 import pandas as pd
 from openpyxl.utils import get_column_letter
@@ -378,6 +381,270 @@ def build_result_xlsx(summary: pd.DataFrame, status_df: pd.DataFrame, subset: pd
 
 
 # ============================================================
+# 1-2. 제조업 품질 분석 함수 (Tab 4~8): 전장 구간별 합격률 / 공정능력 / 분포 / 상관 / 관리도
+#   - 차트는 Streamlit 에 기본 포함된 Altair 로 그린다 (별도 패키지 설치 불필요).
+#   - 차트 안의 필드 이름은 일부러 영문(ASCII)으로 쓴다 (Vega 표현식에서 한글 식별자 오류 방지).
+# ============================================================
+
+def _last_number(text):
+    """머리글 텍스트의 마지막 숫자 (예: '전장 275.16' -> 275.16, '3-1 일자 Y 219.66' -> 219.66)."""
+    nums = _re.findall(r"-?\d+(?:\.\d+)?", str(text))
+    return float(nums[-1]) if nums else None
+
+
+def pass_matrix(df: pd.DataFrame, specs: dict) -> pd.DataFrame:
+    """타겟 항목별 합격 여부(경계 포함)와, 전부 만족한 '전체' 열."""
+    out = pd.DataFrame(index=df.index)
+    for key, (lo, hi) in specs.items():
+        lo, hi = (lo, hi) if lo <= hi else (hi, lo)
+        out[key] = (df[key] >= lo) & (df[key] <= hi)
+    out["전체"] = out[list(specs)].all(axis=1)
+    return out
+
+
+# ---------- (4) 전장 구간별 합격률 ----------
+def length_bin_table(df: pd.DataFrame, specs: dict, width: float) -> pd.DataFrame:
+    flags = pass_matrix(df, specs)
+    start = (np.floor(df["전장"].values / width + 1e-9) * width).round(6)
+    t = pd.DataFrame({"start": start, "ok": flags["전체"].values})
+    for k in specs:
+        t[k] = flags[k].values
+    g = t.groupby("start")
+    out = pd.DataFrame({
+        "시료 수": g.size(),
+        "합격 수": g["ok"].sum().astype(int),
+        "합격률(%)": g["ok"].mean() * 100,
+    })
+    for k in specs:
+        out[f"{k} 단독 합격률(%)"] = g[k].mean() * 100
+    out = out.reset_index().rename(columns={"start": "구간 시작"})
+    out["구간 끝"] = (out["구간 시작"] + width).round(6)
+    out["전장 구간"] = [f"{a:.2f} ~ {b:.2f}" for a, b in zip(out["구간 시작"], out["구간 끝"])]
+    cols = ["전장 구간", "시료 수", "합격 수", "합격률(%)"] + [f"{k} 단독 합격률(%)" for k in specs] + ["구간 시작", "구간 끝"]
+    return out[cols]
+
+
+def length_threshold_curve(df: pd.DataFrame, specs: dict, step: float = 0.02) -> pd.DataFrame:
+    """'전장 >= t' 인 시료만 남겼을 때의 시료 수와 합격률을 t 를 올려가며 계산한다."""
+    flags = pass_matrix(df, specs)["전체"].values
+    x = df["전장"].values
+    grid = np.arange(np.floor(x.min() / step) * step, x.max(), step)
+    rows = []
+    for t in grid:
+        m = x >= t - 1e-9
+        n = int(m.sum())
+        if n:
+            rows.append({"전장 하한": round(float(t), 4), "시료 수": n, "합격률(%)": float(flags[m].mean() * 100)})
+    return pd.DataFrame(rows)
+
+
+def recommend_threshold(curve: pd.DataFrame, target_pct: float, min_n: int):
+    """목표 합격률 이상이면서 시료 수가 min_n 이상인 가장 낮은 전장 하한. 없으면 None."""
+    sub = curve[(curve["합격률(%)"] >= target_pct) & (curve["시료 수"] >= min_n)]
+    return None if sub.empty else sub.iloc[0]
+
+
+# ---------- (2) 공정능력 ----------
+def _norm_sf(z: float) -> float:
+    return 0.5 * math.erfc(z / math.sqrt(2))
+
+
+def capability(x, lsl=None, usl=None) -> dict:
+    """Cp / Cpk (σ = 표본 표준편차), 백분위 방식 Cpk, 정규분포 가정 예상 불량 PPM, 실측 불량 수.
+    lsl 또는 usl 하나만 주면 한쪽 규격(Cpl 또는 Cpu 만)으로 계산한다."""
+    x = pd.Series(x).dropna().astype(float)
+    n = len(x)
+    out = {"n": n, "mean": float(x.mean()) if n else np.nan, "std": float(x.std(ddof=1)) if n > 1 else np.nan}
+    if n < 3 or not out["std"] or (lsl is None and usl is None):
+        out.update(cp=np.nan, cpk=np.nan, cpk_pct=np.nan, ppm=np.nan, n_out=np.nan)
+        return out
+    m, sd = out["mean"], out["std"]
+    cpl = (m - lsl) / (3 * sd) if lsl is not None else None
+    cpu = (usl - m) / (3 * sd) if usl is not None else None
+    out["cp"] = (usl - lsl) / (6 * sd) if (lsl is not None and usl is not None) else np.nan
+    out["cpk"] = min(v for v in (cpl, cpu) if v is not None)
+
+    p50, p_hi, p_lo = x.median(), x.quantile(0.99865), x.quantile(0.00135)
+    pct = []
+    if usl is not None and p_hi > p50:
+        pct.append((usl - p50) / (p_hi - p50))
+    if lsl is not None and p50 > p_lo:
+        pct.append((p50 - lsl) / (p50 - p_lo))
+    out["cpk_pct"] = min(pct) if pct else np.nan
+
+    ppm = 0.0
+    if lsl is not None:
+        ppm += _norm_sf((m - lsl) / sd)
+    if usl is not None:
+        ppm += _norm_sf((usl - m) / sd)
+    out["ppm"] = ppm * 1e6
+    bad = pd.Series(False, index=x.index)
+    if lsl is not None:
+        bad |= x < lsl
+    if usl is not None:
+        bad |= x > usl
+    out["n_out"] = int(bad.sum())
+    return out
+
+
+def cap_rating(c) -> str:
+    if c is None or (isinstance(c, float) and np.isnan(c)):
+        return "-"
+    if c >= 1.67:
+        return "우수 (≥1.67)"
+    if c >= 1.33:
+        return "양호 (≥1.33)"
+    if c >= 1.00:
+        return "보통 · 개선 필요 (≥1.00)"
+    return "부족 (<1.00)"
+
+
+# ---------- (1) 분포 ----------
+def describe_item(x) -> dict:
+    x = pd.Series(x).dropna().astype(float)
+    n = len(x)
+    if n < 3:
+        return {"n": n}
+    m, sd = x.mean(), x.std(ddof=1)
+    d = x - m
+    m2 = (d ** 2).mean()
+    skew = (d ** 3).mean() / m2 ** 1.5 if m2 > 0 else 0.0
+    kurt = (d ** 4).mean() / m2 ** 2 - 3 if m2 > 0 else 0.0
+    jb = n / 6 * (skew ** 2 + kurt ** 2 / 4)  # Jarque-Bera (자유도 2 -> p = exp(-JB/2))
+    return {"n": n, "평균": m, "표준편차": sd, "최소": x.min(), "중앙값": x.median(), "최대": x.max(),
+            "왜도": skew, "첨도(초과)": kurt, "정규성 p값(JB)": math.exp(-jb / 2)}
+
+
+_LINE_KINDS = ["LSL", "USL", "기준값", "CL", "UCL", "LCL", "목표"]
+_LINE_COLORS = ["#fb7185", "#fb7185", "#10b981", "#10b981", "#a78bfa", "#a78bfa", "#10b981"]  # 규격=분홍, 관리한계=보라 (막대 색과 구분)
+
+
+def _line_color_scale(kinds=None):
+    pairs = [(k, c) for k, c in zip(_LINE_KINDS, _LINE_COLORS) if kinds is None or k in kinds]
+    return alt.Scale(domain=[k for k, _ in pairs], range=[c for _, c in pairs])
+
+
+def _dark(chart, height=320):
+    """검은 배경 테마에 맞춰 Altair 차트 색을 지정한다 (composite 차트의 최상위에서 한 번만 호출)."""
+    return (chart.properties(height=height, background="#000000")
+            .configure_axis(labelColor=TEXT_MUTED, titleColor=TEXT_MAIN, gridColor="#1f1f1f",
+                            domainColor=BORDER_STRONG, tickColor=BORDER_STRONG)
+            .configure_legend(labelColor=TEXT_MAIN, titleColor=TEXT_MAIN)
+            .configure_title(color=TEXT_MAIN)
+            .configure_view(strokeWidth=0))
+
+
+def hist_chart(x, label, spec_lines=None):
+    x = np.asarray(pd.Series(x).dropna(), dtype=float)
+    nb = int(min(40, max(10, round(math.sqrt(len(x))))))
+    counts, edges = np.histogram(x, bins=nb)
+    bars = pd.DataFrame({"start": edges[:-1], "end": edges[1:], "count": counts, "zero": 0})
+    m, sd = x.mean(), x.std(ddof=1)
+    bw = edges[1] - edges[0]
+    grid = np.linspace(edges[0], edges[-1], 200)
+    curve = pd.DataFrame({"x": grid, "y": np.exp(-0.5 * ((grid - m) / sd) ** 2) / (sd * math.sqrt(2 * math.pi)) * len(x) * bw})
+    bar = alt.Chart(bars).mark_rect(color=ACCENT_BLUE, opacity=0.85, stroke="#000000", strokeWidth=1).encode(
+        x=alt.X("start:Q", title=label, scale=alt.Scale(zero=False), axis=alt.Axis(tickCount=10, labelOverlap=True)), x2="end:Q",
+        y=alt.Y("count:Q", title="시료 수"), y2="zero:Q",
+        tooltip=[alt.Tooltip("start:Q", format=".3f", title="구간 시작"), alt.Tooltip("end:Q", format=".3f", title="구간 끝"),
+                 alt.Tooltip("count:Q", title="시료 수")])
+    line = alt.Chart(curve).mark_line(color="#60a5fa", strokeWidth=2).encode(x="x:Q", y="y:Q")
+    layers = [bar, line]
+    if spec_lines:
+        rules = pd.DataFrame([{"x": v, "kind": k} for k, v in spec_lines])
+        layers.append(alt.Chart(rules).mark_rule(strokeDash=[6, 4], strokeWidth=2).encode(
+            x="x:Q", color=alt.Color("kind:N", scale=_line_color_scale([k for k, _ in spec_lines]), legend=alt.Legend(title="기준선"))))
+    return _dark(alt.layer(*layers), 320)
+
+
+def box_compare_chart(all_vals, pass_vals, label):
+    long = pd.concat([
+        pd.DataFrame({"group": "전체 유효 시료", "v": pd.Series(all_vals).dropna().astype(float)}),
+        pd.DataFrame({"group": "스펙 합격 시료", "v": pd.Series(pass_vals).dropna().astype(float)}),
+    ])
+    ch = alt.Chart(long).mark_boxplot(extent=1.5, size=26).encode(
+        y=alt.Y("group:N", title=None),
+        x=alt.X("v:Q", title=label, scale=alt.Scale(zero=False), axis=alt.Axis(tickCount=10, labelOverlap=True)),
+        color=alt.Color("group:N", legend=None, scale=alt.Scale(domain=["전체 유효 시료", "스펙 합격 시료"], range=[ACCENT_BLUE, SUCCESS])))
+    return _dark(ch, 170)
+
+
+# ---------- (3) 상관 / 산점도 ----------
+def corr_heatmap(df, items):
+    c = df[items].corr()
+    long = c.reset_index().melt(id_vars="index", var_name="y", value_name="r").rename(columns={"index": "x"})
+    base = alt.Chart(long).encode(x=alt.X("x:N", title=None, sort=items), y=alt.Y("y:N", title=None, sort=items))
+    rect = base.mark_rect().encode(color=alt.Color(
+        "r:Q", scale=alt.Scale(domain=[-1, 0, 1], range=["#3b82f6", "#111111", "#f59e0b"]), legend=alt.Legend(title="r")))
+    text = base.mark_text(fontSize=13).encode(
+        text=alt.Text("r:Q", format=".2f"),
+        color=alt.condition("abs(datum.r) > 0.5", alt.value("#ffffff"), alt.value("#9ca3af")))
+    return _dark(alt.layer(rect, text), 330)
+
+
+def scatter_chart(sdf, xlabel, ylabel, slope, intercept):
+    xs = np.array([sdf["x"].min(), sdf["x"].max()])
+    fit = pd.DataFrame({"x": xs, "y": slope * xs + intercept})
+    pts = alt.Chart(sdf).mark_circle(size=34, opacity=0.55).encode(
+        x=alt.X("x:Q", title=xlabel, scale=alt.Scale(zero=False)),
+        y=alt.Y("y:Q", title=ylabel, scale=alt.Scale(zero=False)),
+        color=alt.Color("status:N", title="합격 여부", scale=alt.Scale(domain=["합격", "불합격"], range=[SUCCESS, DANGER])),
+        tooltip=[alt.Tooltip("sample:N", title="시료"), alt.Tooltip("x:Q", format=".4f", title=xlabel),
+                 alt.Tooltip("y:Q", format=".4f", title=ylabel), alt.Tooltip("status:N", title="합격 여부")])
+    line = alt.Chart(fit).mark_line(color="#ffffff", strokeDash=[6, 4], strokeWidth=2).encode(x="x:Q", y="y:Q")
+    return _dark(alt.layer(pts, line), 380)
+
+
+# ---------- (5) 런차트 / 관리도 (I-MR) ----------
+def imr_stats(values) -> dict:
+    v = np.asarray(values, dtype=float)
+    n = len(v)
+    mean = float(v.mean())
+    mr = np.abs(np.diff(v))
+    mrbar = float(mr.mean()) if len(mr) else 0.0
+    ucl, lcl, mr_ucl = mean + 2.66 * mrbar, mean - 2.66 * mrbar, 3.267 * mrbar
+    rule1 = (v > ucl) | (v < lcl)  # 관리한계 밖
+    sign = np.sign(v - mean)
+    rule2 = np.zeros(n, dtype=bool)  # 중심선 한쪽에 8점 이상 연속
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and sign[j + 1] == sign[i] and sign[i] != 0:
+            j += 1
+        if sign[i] != 0 and j - i + 1 >= 8:
+            rule2[i:j + 1] = True
+        i = j + 1
+    return {"mean": mean, "mrbar": mrbar, "ucl": ucl, "lcl": lcl, "mr_ucl": mr_ucl,
+            "rule1": rule1, "rule2": rule2, "mr": mr}
+
+
+def imr_charts(order, values, label, st_info, spec_lines=None, window=30):
+    v = np.asarray(values, dtype=float)
+    d = pd.DataFrame({"row": np.asarray(order, dtype=float), "val": v,
+                      "ooc": st_info["rule1"] | st_info["rule2"],
+                      "ma": pd.Series(v).rolling(window, min_periods=max(3, window // 3)).mean().values})
+    base = alt.Chart(d).encode(x=alt.X("row:Q", title="엑셀 행 (파일 순서)", scale=alt.Scale(zero=False)))
+    line = base.mark_line(color="#6b7280", strokeWidth=1).encode(y=alt.Y("val:Q", title=label, scale=alt.Scale(zero=False)))
+    pts = base.mark_point(filled=True, size=26).encode(
+        y="val:Q", color=alt.condition("datum.ooc", alt.value(DANGER), alt.value(ACCENT_BLUE)),
+        tooltip=[alt.Tooltip("row:Q", title="엑셀 행"), alt.Tooltip("val:Q", format=".4f", title=label)])
+    ma = base.mark_line(color="#60a5fa", strokeWidth=2.5).encode(y="ma:Q")
+    lines = [("CL", st_info["mean"]), ("UCL", st_info["ucl"]), ("LCL", st_info["lcl"])] + list(spec_lines or [])
+    rules = alt.Chart(pd.DataFrame([{"y": y, "kind": k} for k, y in lines])).mark_rule(strokeDash=[6, 4], strokeWidth=1.8).encode(
+        y="y:Q", color=alt.Color("kind:N", scale=_line_color_scale([k for k, _ in lines]), legend=alt.Legend(title="기준선")))
+    i_chart = _dark(alt.layer(line, pts, ma, rules), 340)
+
+    mrd = pd.DataFrame({"row": d["row"].values[1:], "mr": st_info["mr"]})
+    mbase = alt.Chart(mrd).encode(x=alt.X("row:Q", title="엑셀 행 (파일 순서)", scale=alt.Scale(zero=False)))
+    mline = mbase.mark_line(color="#6b7280", strokeWidth=1).encode(y=alt.Y("mr:Q", title="이동범위 |x(i)-x(i-1)|"))
+    mpts = mbase.mark_point(filled=True, size=20, color=ACCENT_BLUE).encode(y="mr:Q")
+    mrule = alt.Chart(pd.DataFrame([{"y": st_info["mr_ucl"], "kind": "UCL"}])).mark_rule(strokeDash=[6, 4], strokeWidth=1.8).encode(
+        y="y:Q", color=alt.Color("kind:N", scale=_line_color_scale(), legend=None))
+    mr_chart = _dark(alt.layer(mline, mpts, mrule), 220)
+    return i_chart, mr_chart
+
+
+# ============================================================
 # 2. UI (원본과 동일한 로그인 → 사이드바 입력 → 상단 탭 구조)
 # ============================================================
 login_gate()
@@ -540,11 +807,14 @@ with st.sidebar:
 # ------------------------------------------------------------------
 if st.session_state.get("is_owner"):
     NAV_ITEMS = ["Tab 1. 스펙 만족 시료 Min/Max 분석", "Tab 2. 스펙 합격 시료 전체 보기", "Tab 3. 인식된 열 정보",
+                 "Tab 4. 전장 구간별 합격률", "Tab 5. 공정능력 (Cpk)", "Tab 6. 분포 분석", "Tab 7. 상관 · 산점도", "Tab 8. 런차트 · 관리도",
                  "처리 이력 · 통계", "분석 설정 관리", "참고 / 한계 사항"]
-    tab_main, tab_samples, tab_cols, tab_history, tab_sync, tab_help = st.tabs(NAV_ITEMS)
+    (tab_main, tab_samples, tab_cols, tab_bin, tab_cap, tab_dist, tab_corr, tab_imr,
+     tab_history, tab_sync, tab_help) = st.tabs(NAV_ITEMS)
 else:
-    tab_main, tab_samples, tab_cols = st.tabs(
-        ["Tab 1. 스펙 만족 시료 Min/Max 분석", "Tab 2. 스펙 합격 시료 전체 보기", "Tab 3. 인식된 열 정보"])
+    (tab_main, tab_samples, tab_cols, tab_bin, tab_cap, tab_dist, tab_corr, tab_imr) = st.tabs(
+        ["Tab 1. 스펙 만족 시료 Min/Max 분석", "Tab 2. 스펙 합격 시료 전체 보기", "Tab 3. 인식된 열 정보",
+         "Tab 4. 전장 구간별 합격률", "Tab 5. 공정능력 (Cpk)", "Tab 6. 분포 분석", "Tab 7. 상관 · 산점도", "Tab 8. 런차트 · 관리도"])
     tab_history = tab_sync = tab_help = None
 
 
@@ -603,6 +873,7 @@ with tab_main:
             st.session_state["mm_result"] = {
                 "summary": summary, "subset": subset, "status": status_df, "specs": _specs, "spec_txt": spec_txt,
                 "var_keys": list(_var_rules), "cols": cols, "info": info, "file": _file_name, "sheet": sheet_name,
+                "df": df, "nominals": {k: _last_number(cols[k]["header"]) for k in _var_rules},
                 "xlsx": build_result_xlsx(summary, status_df, subset, params) if not subset.empty else None,
             }
 
@@ -716,6 +987,258 @@ with tab_cols:
         st.caption("엑셀 머리글에서 찾은 변수(전장, 일자-Y)와 타겟(위치도, 윤곽도) 항목의 열 위치입니다.")
         st.dataframe(_cols_table(_r["cols"]), use_container_width=True, hide_index=True)
 
+def _analysis_result():
+    r = st.session_state.get("mm_result")
+    if r is None or "df" not in r:
+        st.info("아직 분석 결과가 없습니다. Tab 1에서 타겟 스펙을 확인하고 'Min/Max 분석 실행'을 눌러주세요.")
+        return None
+    return r
+
+
+def _analysis_items(r):
+    return list(r["var_keys"]) + list(r["specs"].keys())
+
+
+def _pick_dataset(r, key):
+    choice = st.radio("분석 대상", ["전체 유효 시료", "스펙 합격 시료"], horizontal=True, key=key)
+    return (r["df"] if choice == "전체 유효 시료" else r["subset"]), choice
+
+
+def _spec_lines_for(r, k):
+    """분포/관리도 차트에 그릴 기준선. 타겟은 실행 때 쓴 스펙(상한), 전장·일자-Y 는 기준값만."""
+    lines = []
+    if k in r["specs"]:
+        lo, hi = sorted(r["specs"][k])
+        if lo > 0:
+            lines.append(("LSL", lo))
+        lines.append(("USL", hi))
+    else:  # 전장·일자-Y: 규격(공차)이 없는 관리 변수 -> 머리글에 적힌 기준값만 참고선으로 표시
+        nom = (r.get("nominals") or {}).get(k)
+        if nom is not None:
+            lines.append(("기준값", nom))
+    return lines
+
+
+# ---------------- Tab 4. 전장 구간별 합격률 ----------------
+with tab_bin:
+    r = _analysis_result()
+    if r is not None:
+        df_all, specs = r["df"], r["specs"]
+        st.markdown('<div class="block-title">분석 조건</div>', unsafe_allow_html=True)
+        b1, b2, b3 = st.columns(3)
+        width = b1.select_slider("전장 구간 폭 (mm)", options=[0.05, 0.1, 0.2, 0.25, 0.5], value=0.1, key="bin_width")
+        target_pct = b2.slider("목표 합격률 (%)", 50, 100, 90, key="bin_target")
+        min_n = b3.number_input("최소 시료 수 (신뢰 기준)", min_value=5, max_value=500, value=30, step=5, key="bin_min_n")
+
+        table = length_bin_table(df_all, specs, width)
+        curve = length_threshold_curve(df_all, specs)
+        rec = recommend_threshold(curve, target_pct, int(min_n))
+        overall = len(r["subset"]) / len(df_all) * 100 if len(df_all) else 0
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.markdown(_kpi("전체 합격률", f"{overall:.1f}%", f"{len(r['subset'])}개 / {len(df_all)}개"), unsafe_allow_html=True)
+        if rec is not None:
+            k2.markdown(_kpi("권장 전장 하한", f"{rec['전장 하한']:.2f} mm", f"합격률 {target_pct}% 이상 · 시료 {int(min_n)}개 이상", color=SUCCESS), unsafe_allow_html=True)
+            k3.markdown(_kpi("그 하한에서의 합격률", f"{rec['합격률(%)']:.1f}%", f"전체 대비 {rec['합격률(%)'] - overall:+.1f}%p"), unsafe_allow_html=True)
+            k4.markdown(_kpi("그 하한 이상 시료 수", f"{int(rec['시료 수'])}개", f"전체의 {rec['시료 수'] / len(df_all) * 100:.0f}%"), unsafe_allow_html=True)
+        else:
+            k2.markdown(_kpi("권장 전장 하한", "없음", "목표를 만족하는 구간 없음", color=WARNING), unsafe_allow_html=True)
+            ok_curve = curve[curve["시료 수"] >= int(min_n)]
+            best = ok_curve.loc[ok_curve["합격률(%)"].idxmax()] if not ok_curve.empty else None
+            k3.markdown(_kpi("달성 가능한 최대 합격률", f"{best['합격률(%)']:.1f}%" if best is not None else "-",
+                             f"전장 {best['전장 하한']:.2f} mm 이상" if best is not None else ""), unsafe_allow_html=True)
+            k4.markdown(_kpi("목표 합격률", f"{target_pct}%"), unsafe_allow_html=True)
+
+        st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+        st.markdown('<div class="block-title">① 전장 구간별 합격률</div>', unsafe_allow_html=True)
+        cdf = pd.DataFrame({"label": table["전장 구간"], "rate": table["합격률(%)"], "n": table["시료 수"], "ok": table["합격 수"]})
+        cdf["level"] = np.where(cdf["n"] < int(min_n), "표본 부족",
+                                np.where(cdf["rate"] >= target_pct, "목표 이상", "목표 미만"))
+        bars = alt.Chart(cdf).mark_bar().encode(
+            x=alt.X("label:N", sort=None, title="전장 구간 (mm)"),
+            y=alt.Y("rate:Q", title="합격률 (%)", scale=alt.Scale(domain=[0, 105])),
+            color=alt.Color("level:N", title="구분", scale=alt.Scale(domain=["목표 이상", "목표 미만", "표본 부족"], range=[SUCCESS, ACCENT_BLUE, "#4b5563"])),
+            tooltip=[alt.Tooltip("label:N", title="전장 구간"), alt.Tooltip("rate:Q", format=".1f", title="합격률(%)"),
+                     alt.Tooltip("ok:Q", title="합격 수"), alt.Tooltip("n:Q", title="시료 수")])
+        labels = alt.Chart(cdf).mark_text(dy=-8, color="#cbd5e1", fontSize=11).encode(
+            x=alt.X("label:N", sort=None), y="rate:Q", text=alt.Text("n:Q"))
+        goal = alt.Chart(pd.DataFrame({"y": [target_pct], "kind": ["목표"]})).mark_rule(strokeDash=[6, 4], strokeWidth=1.8).encode(
+            y="y:Q", color=alt.Color("kind:N", scale=_line_color_scale(), legend=None))
+        st.altair_chart(_dark(alt.layer(bars, labels, goal), 340), use_container_width=True, theme=None)
+        st.caption("막대 위 숫자는 구간의 시료 수입니다. 회색 막대는 시료 수가 최소 기준보다 적어 신뢰하기 어려운 구간입니다.")
+
+        st.markdown('<div class="block-title">② 전장 하한을 올렸을 때의 합격률 (누적)</div>', unsafe_allow_html=True)
+        cc = curve[curve["시료 수"] >= int(min_n)].rename(columns={"전장 하한": "thr", "시료 수": "n", "합격률(%)": "rate"})
+        if cc.empty:
+            st.info("최소 시료 수 기준을 만족하는 구간이 없습니다. 기준을 낮춰보세요.")
+        else:
+            cl = alt.Chart(cc).mark_line(color=ACCENT_BLUE, strokeWidth=2.5, point=alt.OverlayMarkDef(color=ACCENT_BLUE, size=30)).encode(
+                x=alt.X("thr:Q", title="전장 하한 (mm) — 이 값 이상인 시료만 남김", scale=alt.Scale(zero=False)),
+                y=alt.Y("rate:Q", title="합격률 (%)", scale=alt.Scale(domain=[0, 105])),
+                tooltip=[alt.Tooltip("thr:Q", format=".2f", title="전장 하한"), alt.Tooltip("rate:Q", format=".1f", title="합격률(%)"),
+                         alt.Tooltip("n:Q", title="남은 시료 수")])
+            layers = [cl, alt.Chart(pd.DataFrame({"y": [target_pct], "kind": ["목표"]})).mark_rule(strokeDash=[6, 4], strokeWidth=1.8).encode(
+                y="y:Q", color=alt.Color("kind:N", scale=_line_color_scale(), legend=None))]
+            if rec is not None:
+                layers.append(alt.Chart(pd.DataFrame({"x": [rec["전장 하한"]], "kind": ["기준값"]})).mark_rule(strokeWidth=2).encode(
+                    x="x:Q", color=alt.Color("kind:N", scale=_line_color_scale(), legend=None)))
+            st.altair_chart(_dark(alt.layer(*layers), 320), use_container_width=True, theme=None)
+
+        with st.expander("구간별 상세 표"):
+            show = table.drop(columns=["구간 시작", "구간 끝"])
+            cfg = {c: st.column_config.NumberColumn(format="%.1f") for c in show.columns if c.endswith("(%)")}
+            st.dataframe(show, use_container_width=True, hide_index=True, column_config=cfg)
+        st.caption("권장 전장 하한은 '이 값 이상으로 관리하면 합격률이 목표에 도달한다'는 통계적 경향입니다. "
+                   "전장은 규격(공차)이 없는 관리 변수이므로, 다른 품질 항목과의 균형은 공정 담당자가 함께 판단하세요.")
+
+
+# ---------------- Tab 5. 공정능력 (Cpk) ----------------
+with tab_cap:
+    r = _analysis_result()
+    if r is not None:
+        data, choice = _pick_dataset(r, "cap_dataset")
+        if choice == "스펙 합격 시료":
+            st.warning("합격 시료만으로 계산하면 규격 밖 시료가 이미 제외돼 있어 능력이 실제보다 좋게 나옵니다. "
+                       "공정능력은 '전체 유효 시료' 기준을 우선 보세요.")
+        st.caption("규격(상한)이 있는 타겟 항목(단축·장축 위치도, 단축 윤곽도)만 계산합니다. "
+                   "전장·일자-Y 는 규격이 없는 관리 변수라서 공정능력 대상이 아닙니다 (분포·상관·관리도 탭에서 분석).")
+
+        rows = []
+        for k, (lo, hi) in r["specs"].items():
+            lo, hi = (lo, hi) if lo <= hi else (hi, lo)
+            lsl = lo if lo > 0 else None  # 0 은 물리적 하한이므로 규격 하한으로 보지 않는다 (한쪽 규격)
+            c = capability(data[k], lsl, hi)
+            rows.append({
+                "항목": k, "규격(상한)": f"{hi:g}" if lsl is None else f"{lsl:g} ~ {hi:g}", "시료 수": c["n"],
+                "평균": c["mean"], "표준편차": c["std"], "Cpk(정규, Cpu)": c["cpk"], "Cpk(백분위)": c["cpk_pct"],
+                "판정(Cpk 기준)": cap_rating(c["cpk"]), "예상 불량 PPM(정규)": c["ppm"], "실측 규격 밖": c["n_out"],
+            })
+        cap_df = pd.DataFrame(rows)
+
+        st.markdown('<div class="block-title">① 타겟 항목별 공정능력</div>', unsafe_allow_html=True)
+        cfg = {c: st.column_config.NumberColumn(format="%.3f") for c in ("평균", "표준편차")}
+        cfg.update({c: st.column_config.NumberColumn(format="%.2f") for c in ("Cpk(정규, Cpu)", "Cpk(백분위)")})
+        cfg["예상 불량 PPM(정규)"] = st.column_config.NumberColumn(format="%.0f")
+        st.dataframe(cap_df, use_container_width=True, hide_index=True, column_config=cfg)
+
+        plot = cap_df.dropna(subset=["Cpk(정규, Cpu)"])
+        if not plot.empty:
+            st.markdown('<div class="block-title">② Cpk 비교 (기준선: 1.00 / 1.33 / 1.67)</div>', unsafe_allow_html=True)
+            cb = alt.Chart(plot).mark_bar(color=ACCENT_BLUE).encode(
+                x=alt.X("항목:N", sort=None, title=None, axis=alt.Axis(labelAngle=0)), y=alt.Y("Cpk(정규, Cpu):Q", title="Cpk"),
+                tooltip=[alt.Tooltip("항목:N"), alt.Tooltip("Cpk(정규, Cpu):Q", format=".2f", title="Cpk"),
+                         alt.Tooltip("판정(Cpk 기준):N", title="판정")])
+            ref = pd.DataFrame({"y": [1.0, 1.33, 1.67], "kind": ["LSL", "기준값", "목표"]})
+            rl = alt.Chart(ref).mark_rule(strokeDash=[6, 4], strokeWidth=1.6).encode(
+                y="y:Q", color=alt.Color("kind:N", scale=_line_color_scale(), legend=None))
+            st.altair_chart(_dark(alt.layer(cb, rl), 300), use_container_width=True, theme=None)
+
+        st.caption(
+            "위치도·윤곽도는 0 이하로 내려갈 수 없는 한쪽(상한) 규격이라 Cp 는 없고 Cpk = Cpu = (USL−μ) / 3σ 만 계산합니다 (σ = 전체 표본 표준편차). "
+            "분포가 0 쪽으로 몰려 한쪽으로 치우쳐 있어, 정규분포 가정 Cpk 와 백분위 방식 Cpk(중앙값에서 99.865% 점까지 거리 기준)를 함께 보여줍니다. "
+            "예상 불량 PPM 은 정규분포 가정 값이라 치우친 분포에서는 실측 규격 밖 수와 차이가 날 수 있습니다.")
+
+
+# ---------------- Tab 6. 분포 분석 ----------------
+with tab_dist:
+    r = _analysis_result()
+    if r is not None:
+        data, choice = _pick_dataset(r, "dist_dataset")
+        items = _analysis_items(r)
+        st.markdown('<div class="block-title">① 기술 통계 · 정규성</div>', unsafe_allow_html=True)
+        stat_df = pd.DataFrame([{"항목": k, **describe_item(data[k])} for k in items])
+        stat_df["정규성 판정"] = np.where(stat_df["정규성 p값(JB)"] < 0.05, "정규분포와 유의하게 다름", "정규성 기각 안 됨")
+        cfg = {c: st.column_config.NumberColumn(format="%.4f") for c in ("평균", "표준편차", "최소", "중앙값", "최대")}
+        cfg.update({"왜도": st.column_config.NumberColumn(format="%.2f"), "첨도(초과)": st.column_config.NumberColumn(format="%.2f"),
+                    "정규성 p값(JB)": st.column_config.NumberColumn(format="%.4f")})
+        st.dataframe(stat_df, use_container_width=True, hide_index=True, column_config=cfg)
+        st.caption("왜도 > 0 이면 오른쪽(큰 값 쪽)으로 꼬리가 깁니다. 시료가 수백 개 이상이면 정규성 검정(Jarque-Bera)은 작은 차이에도 "
+                   "기각되므로, 아래 히스토그램 모양을 함께 보고 판단하세요.")
+
+        st.markdown('<div class="block-title">② 히스토그램 · 박스플롯</div>', unsafe_allow_html=True)
+        sel = st.selectbox("그래프 항목", items, key="dist_item")
+        lines = _spec_lines_for(r, sel)
+        if len(data) >= 3:
+            st.altair_chart(hist_chart(data[sel], sel, lines), use_container_width=True, theme=None)
+            st.altair_chart(box_compare_chart(r["df"][sel], r["subset"][sel], sel), use_container_width=True, theme=None)
+            st.caption(f"히스토그램은 '{choice}' 기준이며, 파란 선은 같은 평균·표준편차의 정규분포입니다. "
+                       "박스플롯은 전체와 합격 시료를 비교합니다 (상자: 25~75%, 가운데 선: 중앙값).")
+            if sel in r["var_keys"]:
+                st.caption("전장·일자-Y 는 규격(공차)이 없는 관리 변수라 초록 점선은 엑셀 머리글의 기준값(참고용)입니다.")
+        else:
+            st.info("시료가 너무 적어 그래프를 그릴 수 없습니다.")
+
+
+# ---------------- Tab 7. 상관 · 산점도 ----------------
+with tab_corr:
+    r = _analysis_result()
+    if r is not None:
+        df_all, items = r["df"], _analysis_items(r)
+        st.markdown('<div class="block-title">① 상관 행렬 (전체 유효 시료, Pearson r)</div>', unsafe_allow_html=True)
+        st.altair_chart(corr_heatmap(df_all, items), use_container_width=True, theme=None)
+        cm = df_all[items].corr()
+        pairs = [{"항목 A": a, "항목 B": b, "상관계수 r": cm.loc[a, b]} for i, a in enumerate(items) for b in items[i + 1:]]
+        pairs_df = pd.DataFrame(pairs).sort_values("상관계수 r", key=lambda s: s.abs(), ascending=False)
+        pairs_df["강도"] = pd.cut(pairs_df["상관계수 r"].abs(), [-0.01, 0.3, 0.5, 0.7, 1.01], labels=["약함", "보통", "강함", "매우 강함"]).astype(str)
+        st.dataframe(pairs_df, use_container_width=True, hide_index=True,
+                     column_config={"상관계수 r": st.column_config.NumberColumn(format="%.2f")})
+        st.caption("|r| 0.3 미만 약함, 0.5 이상 강함, 0.7 이상 매우 강함. 상관은 인과가 아니므로, 강한 쌍은 원인 후보로 보고 공정에서 확인하세요.")
+
+        st.markdown('<div class="block-title">② 산점도 + 회귀선</div>', unsafe_allow_html=True)
+        sx, sy = st.columns(2)
+        x_item = sx.selectbox("X 축", items, index=0, key="sc_x")
+        y_default = items.index("단축 윤곽도") if "단축 윤곽도" in items else min(1, len(items) - 1)
+        y_item = sy.selectbox("Y 축", items, index=y_default, key="sc_y")
+        flags = pass_matrix(df_all, r["specs"])["전체"].values
+        sdf = pd.DataFrame({"x": df_all[x_item].values, "y": df_all[y_item].values, "sample": df_all["시료"].values,
+                            "status": np.where(flags, "합격", "불합격")})
+        if x_item == y_item:
+            st.info("X 축과 Y 축에 서로 다른 항목을 선택해주세요.")
+        else:
+            slope, intercept = np.polyfit(sdf["x"], sdf["y"], 1)
+            rr = float(np.corrcoef(sdf["x"], sdf["y"])[0, 1])
+            m1, m2, m3 = st.columns(3)
+            m1.markdown(_kpi("상관계수 r", f"{rr:.3f}"), unsafe_allow_html=True)
+            m2.markdown(_kpi("결정계수 R²", f"{rr ** 2:.3f}", "X 로 설명되는 Y 변동 비율"), unsafe_allow_html=True)
+            m3.markdown(_kpi("회귀 기울기", f"{slope:.4f}", f"{x_item} 1 증가 시 {y_item} {slope:+.4f}"), unsafe_allow_html=True)
+            st.altair_chart(scatter_chart(sdf, x_item, y_item, slope, intercept), use_container_width=True, theme=None)
+            st.caption("점 색은 3개 타겟 스펙을 모두 만족했는지(합격/불합격)입니다. 흰 점선은 단순 선형 회귀선입니다.")
+
+
+# ---------------- Tab 8. 런차트 · 관리도 ----------------
+with tab_imr:
+    r = _analysis_result()
+    if r is not None:
+        df_all, items = r["df"], _analysis_items(r)
+        i1, i2 = st.columns([2, 1])
+        sel = i1.selectbox("항목", items, key="imr_item")
+        window = i2.slider("이동평균 구간 (시료 수)", 10, 100, 30, step=5, key="imr_window")
+        st.caption("엑셀 행 순서를 시간(생산/측정) 순서로 보고 그립니다. 행 순서가 시간 순서가 아니면 해석에 주의하세요. "
+                   "전체 유효 시료 기준입니다.")
+        vals = df_all[sel].values
+        if len(vals) < 10:
+            st.info("시료가 너무 적어 관리도를 그릴 수 없습니다.")
+        else:
+            info_ = imr_stats(vals)
+            n1, n2 = int(info_["rule1"].sum()), int(info_["rule2"].sum())
+            trend_r = float(np.corrcoef(np.arange(len(vals)), vals)[0, 1])
+            q1, q2, q3, q4 = st.columns(4)
+            q1.markdown(_kpi("중심선 (평균)", f"{info_['mean']:.4f}", f"관리한계 {info_['lcl']:.4f} ~ {info_['ucl']:.4f}"), unsafe_allow_html=True)
+            q2.markdown(_kpi("관리한계 밖 점", f"{n1}개", "규칙 1: ±3σ(I-MR) 초과", color=DANGER if n1 else SUCCESS), unsafe_allow_html=True)
+            q3.markdown(_kpi("연속 8점 한쪽 치우침", f"{n2}개", "규칙 2: 평균 한쪽에 8점 이상", color=DANGER if n2 else SUCCESS), unsafe_allow_html=True)
+            q4.markdown(_kpi("순서-값 상관", f"{trend_r:+.2f}", "|r| 클수록 경향(드리프트) 의심"), unsafe_allow_html=True)
+
+            st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+            st.markdown('<div class="block-title">개별값(I) 관리도 · 런차트</div>', unsafe_allow_html=True)
+            ic, mc = imr_charts(df_all["엑셀 행"].values, vals, sel, info_, _spec_lines_for(r, sel), window)
+            st.altair_chart(ic, use_container_width=True, theme=None)
+            st.markdown('<div class="block-title">이동범위(MR) 관리도</div>', unsafe_allow_html=True)
+            st.altair_chart(mc, use_container_width=True, theme=None)
+            st.caption("관리한계 = 평균 ± 2.66 × 평균이동범위(MR̄), MR 상한 = 3.267 × MR̄ (I-MR 표준 계수). 빨간 점은 규칙 1 또는 2 위반입니다. "
+                       "파란 굵은 선은 이동평균이며, 한쪽으로 계속 움직이면 공정 평균이 이동(드리프트)하고 있다는 신호입니다. "
+                       "관리한계는 '공정이 낼 수 있는 산포'이고 규격과는 다른 개념입니다.")
+
+
 if tab_history is not None:
   with tab_history:
     st.markdown('<div class="block-title">① 처리 이력</div>', unsafe_allow_html=True)
@@ -792,6 +1315,13 @@ if tab_help is not None:
 - **타겟은 '값' 열 기준**: 위치도/윤곽도 열의 값(예: 0.1128)이 스펙 범위 안인지 봅니다. 바로 옆 열의 편차값
   (예: -0.8872)은 쓰지 않습니다.
 - **일자-Y**는 2행 머리글 `3-1 일자 Y 219.66` 열입니다 (`3-2 휨 Y`는 다른 항목이라 포함하지 않습니다).
+- **Tab 4~8 (제조 품질 분석)**: Tab 1 에서 분석을 실행하면 같은 데이터로 아래 분석을 바로 볼 수 있습니다.
+  - Tab 4 전장 구간별 합격률: 전장을 구간으로 나눠 합격률을 보고, 목표 합격률을 만족하는 '권장 전장 하한'을 찾습니다.
+  - Tab 5 공정능력: 규격이 있는 타겟 3개(위치도 2종, 윤곽도)의 Cpk(=Cpu), 백분위 방식 Cpk, 예상 불량 PPM. 전장·일자-Y 는 기하공차 관련
+    관리 변수라 규격이 없어 제외합니다. 규격 밖이 잘려 나간 합격 시료만으로는 능력이 과대평가되니 전체 기준을 우선 보세요.
+  - Tab 6 분포 분석: 기술 통계, 왜도/첨도, 정규성(JB), 히스토그램+정규곡선, 전체 vs 합격 박스플롯.
+  - Tab 7 상관 · 산점도: 항목 간 상관 행렬과 산점도·회귀선 (합격/불합격 색 구분).
+  - Tab 8 런차트 · 관리도: 엑셀 행 순서를 시간 순서로 보고 I-MR 관리도, 이동평균, 이상점 규칙 검출을 합니다.
 - **제외되는 행**: 엑셀 하단의 `MIN / MAX / AVG`, `0.8 미만`, `0.8 이상`, `합격 / 불합격` 같은 요약·구분 행은 시료가 아니므로
   파일명 패턴(기본 `.xls` 또는 `QMS` 포함)으로 걸러냅니다.
 - **열 찾기**: 타겟은 1행(구분 행) 라벨 위치, 변수는 2행 머리글 텍스트로 찾습니다. 열 위치가 바뀌어도 동작하지만
