@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-WELDING-ARM-KW : 용접 암 측정 데이터(DATA-KW.xlsx) -> 전장 범위 내 일자-X / 휨-X Min·Max 추출기
+WELDING-ARM-KW : 용접 암 측정 데이터(DATA-KW.xlsx) -> 타겟 스펙을 만족하는 시료의 전장 / 일자-Y Min·Max 추출기
 ------------------------------------------------------------
-- 측정 데이터 엑셀(2행: 항목 머리글, 3행~: 시료별 측정값)을 업로드
-- '전장' 측정값이 지정한 범위(기본 274.8 ~ 275.2, 경계 포함) 안에 있는 시료만 골라서
-  '일자 X'와 '휨 X'의 Min / Max (측정값과 편차 둘 다)와 해당 시료(파일명, 엑셀 행)를 찾는다
+- 타겟 항목(단축 위치도 0~1.0, 장축 위치도 0~1.0, 단축 윤곽도 0~0.8)을 '모두 동시에' 만족하는
+  시료만 골라서, 변수 항목(전장, 일자-Y)의 Min / Max (측정값과 편차 둘 다)와 해당 시료
+  (파일명, 엑셀 행)를 찾는다. 스펙 경계값은 포함한다.
+- 타겟 항목 열은 1행(구분 행)의 '단축 위치도 / 장축 위치도 / 단축 윤곽도' 라벨 위치로,
+  변수 항목 열은 2행 머리글('전장', '3-1 일자 Y')로 찾는다
 - 엑셀 하단의 MIN / MAX / AVG 요약 행, '0.8 미만' 같은 구분 행은 시료가 아니므로
   파일명 패턴(기본: '.xls' 또는 'QMS' 포함)으로 걸러내서 계산에서 제외한다
 - UI/로그인/임시비밀번호 인프라/사이드바 업로드/상단 탭 구조는 WELDING-ARM-KW 원본과
@@ -25,7 +27,7 @@ from openpyxl.utils import get_column_letter
 # ============================================================
 # 0. 기본 설정 / 스타일 (BA-CAPA 콘솔과 동일한 테마 + 로그인 방식)
 # ============================================================
-st.set_page_config(page_title="WELDING-ARM-KW | 전장 범위 Min/Max 분석", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="WELDING-ARM-KW | 스펙 만족 시료 Min/Max 분석", layout="wide", initial_sidebar_state="expanded")
 
 OWNER_PASSWORD = "nt1234"
 
@@ -256,7 +258,7 @@ def login_gate():
                 </div>
                 <div style='color:{ACCENT_BLUE}; font-size:2.16rem; font-weight:700; letter-spacing:0.04em; text-align:center; margin-bottom:10px; line-height:1.25;'>WELDING ARM 측정 데이터 분석</div>
                 <div style='text-align:center; margin:0 0 4px 0;'>
-                    <span style='display:inline-block; color:{TEXT_MAIN}; font-size:1.35rem; font-weight:600; line-height:1.4; border-bottom:2px solid {ACCENT_BLUE}; padding-bottom:10px;'>전장 범위 내 일자-X · 휨-X Min / Max 추출</span>
+                    <span style='display:inline-block; color:{TEXT_MAIN}; font-size:1.35rem; font-weight:600; line-height:1.4; border-bottom:2px solid {ACCENT_BLUE}; padding-bottom:10px;'>타겟 스펙 만족 시료의 전장 · 일자-Y Min / Max 추출</span>
                 </div>
                 <div style='color:{TEXT_MUTED}; font-size:0.82rem; text-align:center; margin-top:12px;'>V2.0</div>
             </div>""",
@@ -286,21 +288,27 @@ def login_gate():
 # 1. 분석 설정값 / 데이터 처리 함수
 # ============================================================
 
-DEFAULT_LEN_LOW = 274.8
-DEFAULT_LEN_HIGH = 275.2
-
-# 머리글 텍스트(2행)에서 각 항목의 '측정값 열'을 찾는 정규식. 값 열 바로 오른쪽 열이 '편차' 열이다
-# (예: '1 일자 X 119' 열 + 그 옆 빈 머리글 열 = 편차). 머리글 표기가 달라지면 오너 전용
-# '분석 설정 관리' 탭에서 정규식만 고치면 된다.
-DEFAULT_COLUMN_RULES = {
-    "일자-X": r"일자\s*X",
-    "휨-X": r"휨\s*X",
+# 타겟 항목: 1행(구분 행)에 적힌 라벨 위치로 열을 찾는다 (2행 머리글은 '4 일자 119'처럼 구분이 안 됨).
+DEFAULT_TARGET_RULES = {
+    "단축 위치도": r"단축\s*위치도",
+    "장축 위치도": r"장축\s*위치도",
+    "단축 윤곽도": r"단축\s*윤곽도",
+}
+# 타겟 스펙 (하한, 상한) - 경계 포함. 사이드바에서 바꿀 수 있다.
+DEFAULT_TARGET_SPECS = {
+    "단축 위치도": (0.0, 1.0),
+    "장축 위치도": (0.0, 1.0),
+    "단축 윤곽도": (0.0, 0.8),
+}
+# 변수 항목: 2행 머리글 텍스트로 '측정값 열'을 찾고, 바로 오른쪽 열(머리글 비어 있음)을 '편차' 열로 본다.
+# '일자-Y'는 '3-1 일자 Y 219.66' 열이다 ('3-2 휨 Y'와는 다른 항목).
+DEFAULT_VARIABLE_RULES = {
     "전장": r"^\s*전장",
+    "일자-Y": r"일자\s*Y",
 }
 # 시료 행으로 인정할 파일명 패턴 (MIN/MAX/AVG, '0.8 미만' 등 요약·구분 행 제외용)
 DEFAULT_NAME_PATTERN = r"\.xls|QMS"
 
-TARGET_KEYS = ("일자-X", "휨-X")  # Min/Max를 구할 항목
 _SHORT_ID_RX = _re.compile(r"QMS_\d+")
 
 
@@ -320,8 +328,8 @@ def _load_raw_sheet(file_bytes: bytes, sheet_name):
     return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=None)
 
 
-def locate_columns(raw: pd.DataFrame, rules: dict):
-    """'파일명' 머리글 행과, rules 의 각 항목에 해당하는 값 열/편차 열 위치를 찾는다."""
+def locate_columns(raw: pd.DataFrame, var_rules: dict, target_rules: dict):
+    """'파일명' 머리글 행, 변수 항목(값 열/편차 열), 타겟 항목(값 열)의 위치를 찾는다."""
     header_row = None
     for i in range(min(len(raw), 15)):
         if str(raw.iat[i, 0]).strip() == "파일명":
@@ -331,28 +339,48 @@ def locate_columns(raw: pd.DataFrame, rules: dict):
         raise ValueError("A열에서 '파일명' 머리글 행을 찾지 못했습니다. 업로드한 엑셀 형식을 확인해주세요.")
 
     header = raw.iloc[header_row]
+    ncols = raw.shape[1]
     cols, missing = {}, []
-    for key, pattern in rules.items():
+
+    for key, pattern in var_rules.items():
         rx = _re.compile(pattern)
         found = None
-        for c in range(1, raw.shape[1]):
+        for c in range(1, ncols):
             v = header.iat[c]
             if isinstance(v, str) and rx.search(v.replace("\n", " ")):
-                dev = c + 1 if (c + 1 < raw.shape[1] and pd.isna(header.iat[c + 1])) else None
-                found = {"value_col": c, "dev_col": dev, "header": v.strip()}
+                dev = c + 1 if (c + 1 < ncols and pd.isna(header.iat[c + 1])) else None
+                found = {"value_col": c, "dev_col": dev, "header": v.strip(), "kind": "변수"}
                 break
         if found is None:
             missing.append(key)
         else:
             cols[key] = found
+
+    for key, pattern in target_rules.items():
+        rx = _re.compile(pattern)
+        found = None
+        # 머리글 바로 위 행(구분 행)부터 위로, 마지막으로 머리글 행 자체도 확인한다.
+        for r in list(range(header_row - 1, -1, -1)) + [header_row]:
+            for c in range(1, ncols):
+                v = raw.iat[r, c]
+                if isinstance(v, str) and rx.search(v.replace("\n", " ")):
+                    found = {"value_col": c, "dev_col": None, "header": v.strip(), "kind": "타겟"}
+                    break
+            if found:
+                break
+        if found is None:
+            missing.append(key)
+        else:
+            cols[key] = found
+
     if missing:
         raise ValueError(f"머리글에서 다음 항목을 찾지 못했습니다: {', '.join(missing)} (분석 설정 관리 탭의 정규식을 확인해주세요)")
     return header_row, cols
 
 
-def prepare_dataset(raw: pd.DataFrame, rules: dict, name_pattern: str):
-    """시료 행만 골라 '엑셀 행 / 파일명 / 시료 / 일자-X / 휨-X / 전장 (+ 각 편차)' 표로 만든다."""
-    header_row, cols = locate_columns(raw, rules)
+def prepare_dataset(raw: pd.DataFrame, var_rules: dict, target_rules: dict, name_pattern: str):
+    """시료 행만 골라 '엑셀 행 / 파일명 / 시료 / 전장 / 일자-Y (+편차) / 타겟 3종' 표로 만든다."""
+    header_row, cols = locate_columns(raw, var_rules, target_rules)
     body = raw.iloc[header_row + 1:]
 
     out = pd.DataFrame({
@@ -360,12 +388,13 @@ def prepare_dataset(raw: pd.DataFrame, rules: dict, name_pattern: str):
         "파일명": body.iloc[:, 0].astype(str).values,
     })
     out["시료"] = out["파일명"].map(_short_id)
-    for key, info in cols.items():
+    for key in list(var_rules) + list(target_rules):
+        info = cols[key]
         out[key] = pd.to_numeric(body.iloc[:, info["value_col"]], errors="coerce").values
         if info["dev_col"] is not None:
             out[f"{key} 편차"] = pd.to_numeric(body.iloc[:, info["dev_col"]], errors="coerce").values
 
-    key_cols = list(cols.keys())
+    key_cols = list(var_rules) + list(target_rules)
     is_sample = out["파일명"].str.contains(name_pattern, regex=True, na=False)
     has_number = out[key_cols].notna().any(axis=1)
 
@@ -379,15 +408,26 @@ def prepare_dataset(raw: pd.DataFrame, rules: dict, name_pattern: str):
     return df, cols, info
 
 
-def analyze_range(df: pd.DataFrame, low: float, high: float):
-    """전장이 [low, high] (경계 포함, 입력 순서 무관) 안에 있는 시료에서
-    일자-X / 휨-X 각각의 측정값·편차 Min/Max 와 해당 시료를 찾는다."""
-    lo, hi = (low, high) if low <= high else (high, low)
-    subset = df[(df["전장"] >= lo) & (df["전장"] <= hi)].sort_values("전장").reset_index(drop=True)
+def analyze_spec(df: pd.DataFrame, specs: dict, var_keys):
+    """타겟 항목 스펙(하한, 상한 - 경계 포함)을 '전부 동시에' 만족하는 시료만 골라서,
+    변수 항목(var_keys)의 측정값/편차 Min/Max 와 해당 시료를 찾는다."""
+    mask = pd.Series(True, index=df.index)
+    status = []
+    for key, (lo, hi) in specs.items():
+        lo, hi = (lo, hi) if lo <= hi else (hi, lo)
+        ok = (df[key] >= lo) & (df[key] <= hi)
+        status.append({
+            "타겟 항목": key, "스펙": f"{lo:g} ~ {hi:g}",
+            "단독 합격 수": int(ok.sum()), "단독 합격률(%)": (ok.mean() * 100) if len(df) else 0.0,
+            "전체 실측 Min": df[key].min() if len(df) else None, "전체 실측 Max": df[key].max() if len(df) else None,
+        })
+        mask &= ok
+    subset = df[mask].sort_values(list(var_keys)[0]).reset_index(drop=True)
+    status_df = pd.DataFrame(status)
 
     rows = []
     if not subset.empty:
-        for key in TARGET_KEYS:
+        for key in var_keys:
             for label, col in (("측정값", key), ("편차", f"{key} 편차")):
                 if col not in subset.columns:
                     continue
@@ -398,14 +438,15 @@ def analyze_range(df: pd.DataFrame, low: float, high: float):
                     "Max": subset.at[i_max, col], "Max 시료": subset.at[i_max, "시료"], "Max 엑셀 행": int(subset.at[i_max, "엑셀 행"]),
                     "Max-Min": subset.at[i_max, col] - subset.at[i_min, col],
                 })
-    return pd.DataFrame(rows), subset, lo, hi
+    return pd.DataFrame(rows), subset, status_df
 
 
-def build_result_xlsx(summary: pd.DataFrame, subset: pd.DataFrame, params: dict) -> bytes:
+def build_result_xlsx(summary: pd.DataFrame, status_df: pd.DataFrame, subset: pd.DataFrame, params: dict) -> bytes:
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
         summary.to_excel(w, sheet_name="Min_Max 요약", index=False)
-        subset.to_excel(w, sheet_name="범위 내 데이터", index=False)
+        status_df.to_excel(w, sheet_name="타겟 합격 현황", index=False)
+        subset.to_excel(w, sheet_name="합격 시료 데이터", index=False)
         pd.DataFrame(list(params.items()), columns=["조건", "값"]).to_excel(w, sheet_name="분석 조건", index=False)
         for ws in w.book.worksheets:
             for idx, col in enumerate(ws.iter_cols(min_row=1, max_row=1), start=1):
@@ -419,8 +460,10 @@ def build_result_xlsx(summary: pd.DataFrame, subset: pd.DataFrame, params: dict)
 # ============================================================
 login_gate()
 
-if "column_rules" not in st.session_state:
-    st.session_state["column_rules"] = dict(DEFAULT_COLUMN_RULES)
+if "var_rules" not in st.session_state:
+    st.session_state["var_rules"] = dict(DEFAULT_VARIABLE_RULES)
+if "target_rules" not in st.session_state:
+    st.session_state["target_rules"] = dict(DEFAULT_TARGET_RULES)
 if "name_pattern" not in st.session_state:
     st.session_state["name_pattern"] = DEFAULT_NAME_PATTERN
 
@@ -514,7 +557,7 @@ def render_header():
     res = st.session_state.get("mm_result")
     status_txt = "분석 완료" if res else "대기 중"
     status_color = SUCCESS if res else TEXT_MUTED
-    range_txt = f"{res['lo']:g} ~ {res['hi']:g}" if res else "-"
+    pass_txt = f"{len(res['subset'])}개 / {res['info']['n_samples']}개" if res else "-"
     st.markdown(
         f"""<div class='glass-card' style='padding:18px 22px;margin-bottom:14px;display:flex;align-items:center;gap:18px;'>
             <img src='data:image/png;base64,{ILJIN_LOGO_B64}' style='height:13px;flex-shrink:0;'/>
@@ -522,12 +565,12 @@ def render_header():
             <div>
                 <div style='color:{ACCENT_BLUE};font-size:2.04rem;font-weight:700;letter-spacing:0.02em;margin-bottom:4px;line-height:1.2;'>WELDING ARM 측정 데이터 분석</div>
                 <div style='display:flex;align-items:baseline;gap:10px;margin-bottom:2px;'>
-                    <span style='color:{TEXT_MAIN};font-size:1.3rem;font-weight:700;border-bottom:2px solid {ACCENT_BLUE};padding-bottom:2px;'>전장 범위 내 일자-X · 휨-X Min / Max 추출</span>
-                    <span style='color:{TEXT_MUTED};font-size:0.85rem;'>V1.0</span>
+                    <span style='color:{TEXT_MAIN};font-size:1.3rem;font-weight:700;border-bottom:2px solid {ACCENT_BLUE};padding-bottom:2px;'>타겟 스펙 만족 시료의 전장 · 일자-Y Min / Max 추출</span>
+                    <span style='color:{TEXT_MUTED};font-size:0.85rem;'>V2.0</span>
                 </div>
                 <div style='color:{TEXT_MUTED};font-size:0.85rem;'>
                     상태: <span style='color:{status_color};font-weight:600;'>{status_txt}</span>
-                    &nbsp;·&nbsp; 최근 전장 범위: <b style='color:{TEXT_MAIN};'>{range_txt}</b>
+                    &nbsp;·&nbsp; 스펙 합격 시료: <b style='color:{TEXT_MAIN};'>{pass_txt}</b>
                 </div>
             </div>
         </div>""",
@@ -538,11 +581,11 @@ def render_header():
 render_header()
 
 # ------------------------------------------------------------------
-# 사이드바: 데이터 업로드 + 전장 범위 입력 + 실행 (+ 오너 전용 임시비밀번호 관리)
+# 사이드바: 데이터 업로드 + 타겟 스펙 입력 + 실행 (+ 오너 전용 임시비밀번호 관리)
 # ------------------------------------------------------------------
 with st.sidebar:
     st.markdown(f"<div style='margin-bottom:6px;'><img src='data:image/png;base64,{ILJIN_LOGO_B64}' style='height:20px;'/></div>", unsafe_allow_html=True)
-    st.caption("용접 암 측정 데이터 → 전장 범위 내 일자-X · 휨-X Min/Max 추출")
+    st.caption("용접 암 측정 데이터 → 타겟 스펙 만족 시료의 전장 · 일자-Y Min/Max")
     st.markdown("---")
 
     with st.expander("STEP 1 · 데이터 업로드 및 Min/Max 분석", expanded=True):
@@ -559,51 +602,58 @@ with st.sidebar:
                 st.error(f"엑셀을 여는 중 오류가 발생했습니다 (열기 암호가 걸린 파일은 열 수 없습니다): {e}")
                 data_bytes = None
 
-        st.markdown('<div class="block-title">STEP 1-2. 전장 범위 (mm)</div>', unsafe_allow_html=True)
-        rc1, rc2 = st.columns(2)
-        len_low = rc1.number_input("하한", value=DEFAULT_LEN_LOW, step=0.05, format="%.3f", key="len_low")
-        len_high = rc2.number_input("상한", value=DEFAULT_LEN_HIGH, step=0.05, format="%.3f", key="len_high")
-        st.caption("하한/상한 경계값도 범위에 포함됩니다. 순서를 바꿔 입력해도 자동으로 정렬됩니다.")
+        st.markdown('<div class="block-title">STEP 1-2. 타겟 항목 스펙 (3개 모두 만족)</div>', unsafe_allow_html=True)
+        specs = {}
+        for _key in st.session_state["target_rules"]:
+            _d_lo, _d_hi = DEFAULT_TARGET_SPECS.get(_key, (0.0, 1.0))
+            st.markdown(f"<div style='font-size:0.85rem;color:{TEXT_MUTED};margin-top:4px;'>{_key}</div>", unsafe_allow_html=True)
+            _c1, _c2 = st.columns(2)
+            _lo = _c1.number_input("하한", value=float(_d_lo), step=0.1, format="%.3f", key=f"spec_lo_{_key}")
+            _hi = _c2.number_input("상한", value=float(_d_hi), step=0.1, format="%.3f", key=f"spec_hi_{_key}")
+            specs[_key] = (_lo, _hi)
+        st.caption("하한/상한 경계값도 합격에 포함됩니다. 변수 항목은 전장, 일자-Y 입니다.")
 
         if data_bytes is None:
             st.info("측정 데이터 엑셀을 업로드하면 실행할 수 있습니다.")
 
         if st.button("Min/Max 분석 실행", type="primary", disabled=data_bytes is None):
-            _rules = dict(st.session_state["column_rules"])
+            _var_rules = dict(st.session_state["var_rules"])
+            _target_rules = dict(st.session_state["target_rules"])
             _name_pat = st.session_state["name_pattern"]
             _file_name = data_file.name
+            _specs = dict(specs)
 
             def _analyze_work(update_progress):
                 update_progress("엑셀 파일을 읽는 중...")
                 raw = _load_raw_sheet(data_bytes, sheet_name)
-                update_progress("일자-X / 휨-X / 전장 열을 찾고 시료 행만 추리는 중...")
-                df, cols, info = prepare_dataset(raw, _rules, _name_pat)
-                update_progress("전장 범위로 필터링하고 Min/Max 계산하는 중...")
-                summary, subset, lo, hi = analyze_range(df, len_low, len_high)
+                update_progress("타겟/변수 열을 찾고 시료 행만 추리는 중...")
+                df, cols, info = prepare_dataset(raw, _var_rules, _target_rules, _name_pat)
+                update_progress("3개 타겟 스펙을 모두 만족하는 시료를 고르는 중...")
+                summary, subset, status_df = analyze_spec(df, _specs, list(_var_rules))
 
                 update_progress("결과 파일 만드는 중...")
+                spec_txt = " / ".join(f"{k} {min(v):g}~{max(v):g}" for k, v in _specs.items())
                 params = {
-                    "데이터 파일": _file_name, "시트": sheet_name,
-                    "전장 하한": lo, "전장 상한": hi, "경계 포함": "예",
-                    "유효 시료 수": info["n_samples"], "범위 내 시료 수": len(subset),
+                    "데이터 파일": _file_name, "시트": sheet_name, "타겟 스펙(경계 포함)": spec_txt,
+                    "변수 항목": ", ".join(_var_rules), "유효 시료 수": info["n_samples"], "스펙 합격 시료 수": len(subset),
                 }
                 st.session_state["mm_result"] = {
-                    "summary": summary, "subset": subset, "lo": lo, "hi": hi,
-                    "cols": cols, "info": info, "file": _file_name, "sheet": sheet_name,
-                    "xlsx": build_result_xlsx(summary, subset, params) if not subset.empty else None,
+                    "summary": summary, "subset": subset, "status": status_df, "specs": _specs, "spec_txt": spec_txt,
+                    "var_keys": list(_var_rules), "cols": cols, "info": info, "file": _file_name, "sheet": sheet_name,
+                    "xlsx": build_result_xlsx(summary, status_df, subset, params) if not subset.empty else None,
                 }
 
                 update_progress("처리 이력 기록하는 중...")
                 hist = st.session_state.setdefault("process_history", [])
                 rec = {"시각": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "데이터 파일": _file_name,
-                       "전장 범위": f"{lo:g} ~ {hi:g}", "범위 내 시료 수": len(subset)}
+                       "타겟 스펙": spec_txt, "스펙 합격 시료 수": len(subset)}
                 if not summary.empty:
-                    for key in TARGET_KEYS:
+                    for key in _var_rules:
                         r = summary[(summary["항목"] == key) & (summary["구분"] == "측정값")].iloc[0]
                         rec[f"{key} Min ~ Max"] = f"{r['Min']:.4f} ~ {r['Max']:.4f}"
                 hist.insert(0, rec)
-                st.session_state.setdefault("range_counter", Counter()).update([f"{lo:g} ~ {hi:g}"])
-                return {"n_in": len(subset), "lo": lo, "hi": hi}
+                st.session_state.setdefault("spec_counter", Counter()).update([spec_txt])
+                return {"n_in": len(subset), "spec_txt": spec_txt}
 
             _run_with_progress("analyze", _analyze_work)
 
@@ -617,9 +667,9 @@ with st.sidebar:
                 with st.expander("상세 오류"):
                     st.code(_tb)
             elif _res["n_in"] == 0:
-                st.warning(f"전장 {_res['lo']:g} ~ {_res['hi']:g} 범위 안에 들어오는 시료가 없습니다. 범위를 확인해주세요.")
+                st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없습니다. 스펙 값을 확인해주세요.")
             else:
-                st.success(f"전장 {_res['lo']:g} ~ {_res['hi']:g} 범위 내 {_res['n_in']}건으로 Min/Max를 계산했습니다. 위쪽 'Tab 1' 에서 확인하세요.")
+                st.success(f"3개 타겟 스펙을 모두 만족하는 시료 {_res['n_in']}건으로 Min/Max를 계산했습니다. 위쪽 'Tab 1' 에서 확인하세요.")
 
     if st.session_state.get("is_owner"):
         st.markdown("---")
@@ -685,10 +735,10 @@ with st.sidebar:
 # 상단 탭
 # ------------------------------------------------------------------
 if st.session_state.get("is_owner"):
-    NAV_ITEMS = ["Tab 1. 전장 범위 Min/Max 분석", "처리 이력 · 통계", "분석 설정 관리", "참고 / 한계 사항"]
+    NAV_ITEMS = ["Tab 1. 스펙 만족 시료 Min/Max 분석", "처리 이력 · 통계", "분석 설정 관리", "참고 / 한계 사항"]
     tab_main, tab_history, tab_sync, tab_help = st.tabs(NAV_ITEMS)
 else:
-    (tab_main,) = st.tabs(["Tab 1. 전장 범위 Min/Max 분석"])
+    (tab_main,) = st.tabs(["Tab 1. 스펙 만족 시료 Min/Max 분석"])
     tab_history = tab_sync = tab_help = None
 
 
@@ -698,20 +748,28 @@ def _kpi(label, value, sub="", color=None):
     return f'<div class="kpi-card"><p class="kpi-label">{label}</p><p class="kpi-value"{style}>{value}</p>{sub_html}</div>'
 
 
+def _cols_table(cols):
+    return pd.DataFrame([
+        {"구분": v["kind"], "항목": k, "인식한 머리글": v["header"], "값 열": get_column_letter(v["value_col"] + 1),
+         "편차 열": get_column_letter(v["dev_col"] + 1) if v["dev_col"] is not None else "-"}
+        for k, v in cols.items()
+    ])
+
+
 with tab_main:
     res = st.session_state.get("mm_result")
     if res is None:
-        st.info("왼쪽 사이드바 STEP 1에서 측정 데이터 엑셀을 업로드하고 전장 범위를 지정한 뒤 'Min/Max 분석 실행'을 눌러주세요.")
+        st.info("왼쪽 사이드바 STEP 1에서 측정 데이터 엑셀을 업로드하고 타겟 스펙을 확인한 뒤 'Min/Max 분석 실행'을 눌러주세요.")
     else:
-        summary, subset, info = res["summary"], res["subset"], res["info"]
+        summary, subset, status_df, info = res["summary"], res["subset"], res["status"], res["info"]
         n_all, n_in = info["n_samples"], len(subset)
         pct = (n_in / n_all * 100) if n_all else 0
 
         k1, k2, k3, k4 = st.columns(4)
-        k1.markdown(_kpi("전장 범위 (mm)", f"{res['lo']:g} ~ {res['hi']:g}"), unsafe_allow_html=True)
+        k1.markdown(_kpi("합격 조건", "3개 타겟 동시 만족", "단축·장축 위치도, 단축 윤곽도"), unsafe_allow_html=True)
         k2.markdown(_kpi("유효 시료 수", f"{n_all}개"), unsafe_allow_html=True)
-        k3.markdown(_kpi("범위 내 시료 수", f"{n_in}개", color=SUCCESS if n_in else WARNING), unsafe_allow_html=True)
-        k4.markdown(_kpi("범위 내 비율", f"{pct:.1f}%"), unsafe_allow_html=True)
+        k3.markdown(_kpi("스펙 합격 시료 수", f"{n_in}개", color=SUCCESS if n_in else WARNING), unsafe_allow_html=True)
+        k4.markdown(_kpi("합격률", f"{pct:.1f}%"), unsafe_allow_html=True)
 
         notes = []
         if info["n_excluded_non_sample"]:
@@ -722,47 +780,51 @@ with tab_main:
             st.caption(" · ".join(notes))
 
         if summary.empty:
-            st.warning("범위 안에 시료가 없어 Min/Max를 계산하지 못했습니다.")
+            st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없어 Min/Max를 계산하지 못했습니다.")
         else:
             st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-            st.markdown('<div class="block-title">① 일자-X / 휨-X Min · Max (측정값 기준)</div>', unsafe_allow_html=True)
+            st.markdown('<div class="block-title">① 전장 / 일자-Y Min · Max (측정값 기준)</div>', unsafe_allow_html=True)
             vals = summary[summary["구분"] == "측정값"].set_index("항목")
-            c1, c2, c3, c4 = st.columns(4)
-            for col_holder, key, kind in ((c1, "일자-X", "Min"), (c2, "일자-X", "Max"), (c3, "휨-X", "Min"), (c4, "휨-X", "Max")):
-                r = vals.loc[key]
-                col_holder.markdown(
-                    _kpi(f"{key} {kind}", f"{r[kind]:.4f}", f"{r[f'{kind} 시료']} (엑셀 {r[f'{kind} 엑셀 행']}행)"),
-                    unsafe_allow_html=True,
-                )
+            card_cols = st.columns(2 * len(res["var_keys"]))
+            idx = 0
+            for key in res["var_keys"]:
+                for kind in ("Min", "Max"):
+                    r = vals.loc[key]
+                    card_cols[idx].markdown(
+                        _kpi(f"{key} {kind}", f"{r[kind]:.4f}", f"{r[f'{kind} 시료']} (엑셀 {r[f'{kind} 엑셀 행']}행)"),
+                        unsafe_allow_html=True,
+                    )
+                    idx += 1
 
             st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
             st.markdown('<div class="block-title">② 상세 표 (측정값 · 편차)</div>', unsafe_allow_html=True)
             num_cfg = {c: st.column_config.NumberColumn(format="%.4f") for c in ("Min", "Max", "Max-Min")}
             st.dataframe(summary, use_container_width=True, hide_index=True, column_config=num_cfg)
 
-            with st.expander("범위 내 시료 전체 보기 (전장 오름차순)"):
+        st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+        st.markdown('<div class="block-title">③ 타겟 항목별 합격 현황</div>', unsafe_allow_html=True)
+        st.caption("'단독 합격'은 그 항목 하나만 봤을 때의 합격 수이고, 위 Min/Max는 세 항목을 모두 만족한 시료만 대상으로 합니다.")
+        stat_cfg = {c: st.column_config.NumberColumn(format="%.4f") for c in ("전체 실측 Min", "전체 실측 Max")}
+        stat_cfg["단독 합격률(%)"] = st.column_config.NumberColumn(format="%.1f")
+        st.dataframe(status_df, use_container_width=True, hide_index=True, column_config=stat_cfg)
+
+        if not subset.empty:
+            with st.expander("스펙 합격 시료 전체 보기 (전장 오름차순)"):
                 st.dataframe(subset, use_container_width=True, hide_index=True)
 
-            if res["cols"]:
-                with st.expander("인식된 열 정보"):
-                    st.dataframe(
-                        pd.DataFrame([
-                            {"항목": k, "인식한 머리글": v["header"], "값 열": get_column_letter(v["value_col"] + 1),
-                             "편차 열": get_column_letter(v["dev_col"] + 1) if v["dev_col"] is not None else "-"}
-                            for k, v in res["cols"].items()
-                        ]),
-                        use_container_width=True, hide_index=True,
-                    )
+        if res["cols"]:
+            with st.expander("인식된 열 정보"):
+                st.dataframe(_cols_table(res["cols"]), use_container_width=True, hide_index=True)
 
+        if res.get("xlsx"):
             st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-            if res.get("xlsx"):
-                st.download_button(
-                    "전장범위_MinMax_결과.xlsx 다운로드",
-                    data=res["xlsx"],
-                    file_name="전장범위_MinMax_결과.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                )
+            st.download_button(
+                "스펙만족_MinMax_결과.xlsx 다운로드",
+                data=res["xlsx"],
+                file_name="스펙만족_MinMax_결과.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+            )
 
 if tab_history is not None:
   with tab_history:
@@ -774,8 +836,8 @@ if tab_history is not None:
     else:
         h1, h2, h3 = st.columns(3)
         h1.markdown(_kpi("이번 세션 분석 횟수", f"{len(history)}회"), unsafe_allow_html=True)
-        h2.markdown(_kpi("최근 전장 범위", history[0]["전장 범위"]), unsafe_allow_html=True)
-        h3.markdown(_kpi("최근 범위 내 시료 수", f"{history[0]['범위 내 시료 수']}개"), unsafe_allow_html=True)
+        h2.markdown(_kpi("최근 스펙 합격 시료 수", f"{history[0]['스펙 합격 시료 수']}개"), unsafe_allow_html=True)
+        h3.markdown(_kpi("최근 분석 파일", history[0]["데이터 파일"]), unsafe_allow_html=True)
         st.markdown("<div style='height:14px;'></div>", unsafe_allow_html=True)
         st.dataframe(pd.DataFrame(history), use_container_width=True, hide_index=True)
         if st.button("이력 초기화"):
@@ -783,37 +845,39 @@ if tab_history is not None:
             st.rerun()
 
     st.markdown("<hr>", unsafe_allow_html=True)
-    st.markdown('<div class="block-title">② 자주 쓰는 전장 범위 (누적 통계)</div>', unsafe_allow_html=True)
-    counter = st.session_state.get("range_counter", Counter())
+    st.markdown('<div class="block-title">② 자주 쓰는 타겟 스펙 설정 (누적 통계)</div>', unsafe_allow_html=True)
+    counter = st.session_state.get("spec_counter", Counter())
     if not counter:
         st.info("아직 집계된 통계가 없습니다.")
     else:
-        stat_df = pd.DataFrame(counter.most_common(20), columns=["전장 범위", "분석 횟수"])
+        stat_df = pd.DataFrame(counter.most_common(20), columns=["타겟 스펙", "분석 횟수"])
         c_left, c_right = st.columns([1, 1])
         with c_left:
             st.dataframe(stat_df, use_container_width=True, hide_index=True)
         with c_right:
-            st.bar_chart(stat_df.set_index("전장 범위"))
+            st.bar_chart(stat_df.set_index("타겟 스펙"))
         if st.button("통계 초기화"):
-            st.session_state["range_counter"] = Counter()
+            st.session_state["spec_counter"] = Counter()
             st.rerun()
 
 if tab_sync is not None:
   with tab_sync:
     st.markdown('<div class="block-title">분석 설정 관리 (오너 전용)</div>', unsafe_allow_html=True)
     st.caption(
-        "엑셀 2행 머리글 텍스트에서 각 항목의 열을 찾는 정규식과, 시료 행으로 인정할 파일명 패턴입니다. "
-        "엑셀의 머리글 표기가 바뀌어 열을 못 찾을 때 여기서 정규식만 고치면 됩니다 (코드 수정 불필요)."
+        "타겟 항목은 엑셀 1행(구분 행)의 라벨, 변수 항목은 2행 머리글 텍스트에서 열을 찾는 정규식입니다. "
+        "시료 행으로 인정할 파일명 패턴도 여기서 바꿉니다. 표기가 바뀌어 열을 못 찾을 때 정규식만 고치면 됩니다 (코드 수정 불필요)."
     )
-    new_rules = {}
-    for key, pat in st.session_state["column_rules"].items():
-        new_rules[key] = st.text_input(f"'{key}' 머리글 정규식", value=pat, key=f"rule_{key}")
+    new_var = {k: st.text_input(f"변수 '{k}' 머리글 정규식", value=p, key=f"vrule_{k}")
+               for k, p in st.session_state["var_rules"].items()}
+    new_tgt = {k: st.text_input(f"타겟 '{k}' 라벨 정규식", value=p, key=f"trule_{k}")
+               for k, p in st.session_state["target_rules"].items()}
     new_name_pat = st.text_input("시료 행 파일명 패턴 (정규식)", value=st.session_state["name_pattern"], key="rule_name_pattern")
     if st.button("분석 설정 저장"):
         try:
-            for p in list(new_rules.values()) + [new_name_pat]:
+            for p in list(new_var.values()) + list(new_tgt.values()) + [new_name_pat]:
                 _re.compile(p)
-            st.session_state["column_rules"] = {k: v.strip() for k, v in new_rules.items()}
+            st.session_state["var_rules"] = {k: v.strip() for k, v in new_var.items()}
+            st.session_state["target_rules"] = {k: v.strip() for k, v in new_tgt.items()}
             st.session_state["name_pattern"] = new_name_pat.strip()
             st.success("저장되었습니다. 다음 분석부터 적용됩니다.")
         except _re.error as e:
@@ -824,29 +888,24 @@ if tab_sync is not None:
         st.markdown('<div class="block-title">현재 업로드 파일에서 열 인식 테스트</div>', unsafe_allow_html=True)
         try:
             _raw = _load_raw_sheet(data_bytes, sheet_name)
-            _hr, _cols = locate_columns(_raw, st.session_state["column_rules"])
-            st.dataframe(
-                pd.DataFrame([
-                    {"항목": k, "인식한 머리글": v["header"], "값 열": get_column_letter(v["value_col"] + 1),
-                     "편차 열": get_column_letter(v["dev_col"] + 1) if v["dev_col"] is not None else "-"}
-                    for k, v in _cols.items()
-                ]),
-                use_container_width=True, hide_index=True,
-            )
+            _hr, _cols = locate_columns(_raw, st.session_state["var_rules"], st.session_state["target_rules"])
+            st.dataframe(_cols_table(_cols), use_container_width=True, hide_index=True)
         except Exception as e:
             st.error(str(e))
 
 if tab_help is not None:
   with tab_help:
     st.markdown("""
-- **계산 기준**: '전장' 측정값(예: 274.93)이 하한 ≤ 전장 ≤ 상한(기본 274.8 ~ 275.2, 경계 포함)인 시료만 대상으로,
-  '일자 X'와 '휨 X'의 **측정값**과 **편차**(측정값 − 기준값) 각각의 Min / Max 를 구합니다.
-  기준값은 엑셀 머리글 기준 일자 X = 119, 휨 X = 156.16 입니다 (편차는 엑셀 자체 계산값을 그대로 사용).
+- **계산 기준**: 타겟 항목 3개(단축 위치도 0~1.0, 장축 위치도 0~1.0, 단축 윤곽도 0~0.8, 경계 포함)를 **모두 동시에** 만족하는
+  시료만 대상으로, 변수 항목 **전장**과 **일자-Y**의 측정값과 편차(엑셀 자체 계산값) 각각의 Min / Max 를 구합니다.
+  타겟 스펙 값은 사이드바에서 바꿀 수 있습니다.
+- **타겟은 '값' 열 기준**: 위치도/윤곽도 열의 값(예: 0.1128)이 스펙 범위 안인지 봅니다. 바로 옆 열의 편차값
+  (예: -0.8872)은 쓰지 않습니다.
+- **일자-Y**는 2행 머리글 `3-1 일자 Y 219.66` 열입니다 (`3-2 휨 Y`는 다른 항목이라 포함하지 않습니다).
 - **제외되는 행**: 엑셀 하단의 `MIN / MAX / AVG`, `0.8 미만`, `0.8 이상`, `합격 / 불합격` 같은 요약·구분 행은 시료가 아니므로
-  파일명 패턴(기본 `.xls` 또는 `QMS` 포함)으로 걸러냅니다. 이 행들의 일자 X 값은 부호가 반대(+119 부근)인 절댓값 통계라
-  섞이면 Max 가 크게 틀어지므로 반드시 제외해야 합니다.
-- **열 찾기**: 2행 머리글 텍스트(`일자 X`, `휨 X`, `전장`)로 열을 찾고, 값 열 바로 오른쪽 열을 편차 열로 봅니다.
-  열 위치가 바뀌어도 동작하지만 머리글 표기가 바뀌면 '분석 설정 관리' 탭에서 정규식을 고쳐야 합니다.
-- **한계**: 한 번에 시트 하나만 분석합니다. 시료 하나에 값이 하나라도 비어 있으면(일자 X / 휨 X / 전장) 그 행은 제외합니다.
+  파일명 패턴(기본 `.xls` 또는 `QMS` 포함)으로 걸러냅니다.
+- **열 찾기**: 타겟은 1행(구분 행) 라벨 위치, 변수는 2행 머리글 텍스트로 찾습니다. 열 위치가 바뀌어도 동작하지만
+  표기가 바뀌면 '분석 설정 관리' 탭에서 정규식을 고쳐야 합니다.
+- **한계**: 한 번에 시트 하나만 분석합니다. 시료 하나에 값이 하나라도 비어 있으면 그 행은 제외합니다.
 - '처리 이력 · 통계' 탭은 이번 접속 세션 동안의 기록만 보여줍니다.
 """)
