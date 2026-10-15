@@ -443,7 +443,120 @@ def window_frames(win: dict):
     return rng, ver
 
 
-def window_scatter_chart(df: pd.DataFrame, ok_flags, win: dict):
+def window_tradeoff(df: pd.DataFrame, ok_flags, xkey: str, ykey: str,
+                    rates=(0.0, 0.005, 0.01, 0.02, 0.03, 0.05), step: float = 0.01):
+    """허용 불합격률(범위 안 시료 중 불합격 비율)별로 '합격 시료를 가장 많이 포함하는' 직사각형 범위를 찾는다.
+    - 0% 는 정확 탐색(find_pass_window), 그 외는 step(mm) 격자 + 2차원 누적합으로 모든 직사각형을 벡터화해서 비교한다.
+    - 격자로 찾은 뒤 실제 시료의 경계값으로 다시 좁히고 시료 기준으로 재검증하므로, 결과 불합격률은 허용률 이하다.
+    - 허용률이 클수록 범위는 같거나 넓어지도록(합격 시료 포함 수가 줄지 않도록) 정리한다."""
+    x = df[xkey].to_numpy(dtype=float)
+    y = df[ykey].to_numpy(dtype=float)
+    ok = np.asarray(ok_flags, dtype=bool)
+    strict = find_pass_window(df, ok, xkey, ykey)
+    if strict is None:
+        return []
+
+    k0x, k1x = int(np.floor(x.min() / step)), int(np.floor(x.max() / step)) + 1
+    k0y, k1y = int(np.floor(y.min() / step)), int(np.floor(y.max() / step)) + 1
+    xe, ye = np.arange(k0x, k1x + 1) * step, np.arange(k0y, k1y + 1) * step
+    nx, ny = len(xe) - 1, len(ye) - 1
+    cp = np.histogram2d(x[ok], y[ok], bins=[xe, ye])[0]
+    cf = np.histogram2d(x[~ok], y[~ok], bins=[xe, ye])[0]
+    sp, sf = np.zeros((nx + 1, ny + 1)), np.zeros((nx + 1, ny + 1))
+    sp[1:, 1:] = cp.cumsum(0).cumsum(1)
+    sf[1:, 1:] = cf.cumsum(0).cumsum(1)
+    ai, bi = np.triu_indices(ny + 1, k=1)
+
+    nonzero = [r for r in rates if r > 0]
+    best = {r: (-np.inf, None) for r in nonzero}
+    for i in range(nx):
+        row_p, row_f = sp[i + 1:] - sp[i], sf[i + 1:] - sf[i]
+        pc = row_p[:, bi] - row_p[:, ai]  # (오른쪽 끝 후보, y 구간 후보) 별 합격 시료 수
+        fc = row_f[:, bi] - row_f[:, ai]  # 같은 위치의 불합격 시료 수
+        score = pc * 10000 - fc           # 합격 시료 수 최대, 같으면 불합격이 적은 쪽
+        for r in nonzero:
+            feas = (fc * (1 - r) <= r * pc + 1e-9) & (pc > 0)
+            if not feas.any():
+                continue
+            sc = np.where(feas, score, -np.inf)
+            k = np.unravel_index(int(np.argmax(sc)), sc.shape)
+            if sc[k] > best[r][0]:
+                best[r] = (sc[k], (i, i + 1 + int(k[0]), int(ai[k[1]]), int(bi[k[1]])))
+
+    def _from_grid(cell):
+        i, j, a, b = cell
+        inside = ok & (x >= xe[i]) & (x < xe[j]) & (y >= ye[a]) & (y < ye[b])
+        if not inside.any():
+            return None
+        xr = (float(x[inside].min()), float(x[inside].max()))
+        yr = (float(y[inside].min()), float(y[inside].max()))
+        box = (x >= xr[0]) & (x <= xr[1]) & (y >= yr[0]) & (y <= yr[1])
+        return {"xkey": xkey, "ykey": ykey, "x": xr, "y": yr, "n_in": int(box.sum()), "n_pass_in": int((box & ok).sum()),
+                "n_fail_in": int((box & ~ok).sum()), "n_pass": int(ok.sum()), "n_total": int(len(df))}
+
+    out = [dict(strict, rate=0.0)]
+    for r in nonzero:
+        cands = [dict(w) for w in out]  # 더 엄격한 허용률의 결과도 후보 (불합격률이 허용률 이하이므로 유효)
+        if best[r][1] is not None:
+            w = _from_grid(best[r][1])
+            if w is not None:
+                cands.append(w)
+        valid = [c for c in cands if c["n_in"] and c["n_fail_in"] / c["n_in"] <= r + 1e-12]
+        pick = max(valid, key=lambda c: (c["n_pass_in"], -c["n_fail_in"]))
+        out.append(dict(pick, rate=r))
+    return out
+
+
+def gauge_design(win: dict, pct: float, wear_pct: float = 0.0, mm_override: dict = None) -> pd.DataFrame:
+    """합격 범위 [L, U] 안쪽에 게이지 제작 공차 영역과 마모 여유를 두고 GO/NO-GO 설계 치수를 계산한다.
+    - 하한측 설계 치수 = L + 마모 여유 + 제작 공차, 제작 공차 -제작공차/0 (실제 제작 치수는 L+마모여유 ~ 설계 치수)
+    - 상한측 설계 치수 = U - 마모 여유 - 제작 공차, 제작 공차 0/+제작공차
+    -> 게이지가 최악(공차 한계)으로 만들어져도 합격 범위 밖 부품은 통과시키지 않는다."""
+    mm_override = mm_override or {}
+    rows = []
+    for key, (lo, hi) in ((win["xkey"], win["x"]), (win["ykey"], win["y"])):
+        width = hi - lo
+        tg = mm_override.get(key)
+        tg = width * pct / 100 if tg is None else float(tg)
+        wear = width * wear_pct / 100
+        lo2, hi2 = lo + wear + tg, hi - wear - tg
+        rows.append({"항목": key, "합격 범위 하한": lo, "합격 범위 상한": hi, "범위 폭": width,
+                     "제작 공차(mm)": tg, "마모 여유(mm)": wear,
+                     "하한측 설계 치수": lo2, "하한측 제작 공차": f"−{tg:.4f} / 0",
+                     "상한측 설계 치수": hi2, "상한측 제작 공차": f"0 / +{tg:.4f}",
+                     "게이지 통과 폭": hi2 - lo2, "설계 가능": bool(hi2 > lo2)})
+    return pd.DataFrame(rows)
+
+
+def gauge_check(df: pd.DataFrame, ok_flags, xkey: str, ykey: str, xr, yr) -> dict:
+    """게이지(설계 치수 범위)로 실제 시료를 판정했을 때의 결과."""
+    x, y = df[xkey].to_numpy(dtype=float), df[ykey].to_numpy(dtype=float)
+    ok = np.asarray(ok_flags, dtype=bool)
+    box = (x >= xr[0]) & (x <= xr[1]) & (y >= yr[0]) & (y <= yr[1])
+    n_pass = int(ok.sum())
+    return {"n_total": int(len(df)), "n_go": int(box.sum()), "n_go_pass": int((box & ok).sum()), "n_go_fail": int((box & ~ok).sum()),
+            "n_pass": n_pass, "n_pass_lost": int((~box & ok).sum())}
+
+
+def build_gauge_xlsx(trade_df: pd.DataFrame, design_df: pd.DataFrame, check: dict, params: dict) -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as w:
+        design_df.to_excel(w, sheet_name="게이지 설계 치수", index=False)
+        pd.DataFrame([{
+            "게이지 통과(GO) 시료 수": check["n_go"], "그 중 합격": check["n_go_pass"], "그 중 불합격(유출)": check["n_go_fail"],
+            "게이지 통과율(%)": check["n_go"] / check["n_total"] * 100 if check["n_total"] else 0.0,
+            "양품 중 게이지 NG 수": check["n_pass_lost"],
+            "양품 손실률(%)": check["n_pass_lost"] / check["n_pass"] * 100 if check["n_pass"] else 0.0,
+        }]).to_excel(w, sheet_name="게이지 판정 검증", index=False)
+        trade_df.to_excel(w, sheet_name="허용 불합격률별 범위", index=False)
+        pd.DataFrame(list(params.items()), columns=["조건", "값"]).to_excel(w, sheet_name="설계 조건", index=False)
+        for ws in w.book.worksheets:
+            for idx, col in enumerate(ws.iter_cols(min_row=1, max_row=1), start=1):
+                ws.column_dimensions[get_column_letter(idx)].width = max(14, len(str(col[0].value or "")) + 4)
+    return bio.getvalue()
+
+
+def window_scatter_chart(df: pd.DataFrame, ok_flags, win: dict, inner: dict = None):
     d = pd.DataFrame({"x": df[win["xkey"]].values, "y": df[win["ykey"]].values, "sample": df["시료"].values,
                       "status": np.where(np.asarray(ok_flags, dtype=bool), "합격", "불합격")})
     pts = alt.Chart(d).mark_circle(size=30, opacity=0.6).encode(
@@ -452,13 +565,16 @@ def window_scatter_chart(df: pd.DataFrame, ok_flags, win: dict):
         color=alt.Color("status:N", title="합격 여부", scale=alt.Scale(domain=["합격", "불합격"], range=[SUCCESS, DANGER])),
         tooltip=[alt.Tooltip("sample:N", title="시료"), alt.Tooltip("x:Q", format=".4f", title=win["xkey"]),
                  alt.Tooltip("y:Q", format=".4f", title=win["ykey"]), alt.Tooltip("status:N", title="합격 여부")])
-    box = alt.Chart(pd.DataFrame({"x1": [win["x"][0]], "x2": [win["x"][1]], "y1": [win["y"][0]], "y2": [win["y"][1]]})).mark_rect(
-        color="#ffffff", fillOpacity=0.10, stroke="#ffffff", strokeWidth=2).encode(x="x1:Q", x2="x2:Q", y="y1:Q", y2="y2:Q")
-    return _dark(alt.layer(pts, box), 420)
+    layers = [pts, alt.Chart(pd.DataFrame({"x1": [win["x"][0]], "x2": [win["x"][1]], "y1": [win["y"][0]], "y2": [win["y"][1]]})).mark_rect(
+        color="#ffffff", fillOpacity=0.10, stroke="#ffffff", strokeWidth=2).encode(x="x1:Q", x2="x2:Q", y="y1:Q", y2="y2:Q")]
+    if inner is not None:  # 게이지 설계 범위(안쪽)를 점선 사각형으로 겹쳐 표시
+        layers.append(alt.Chart(pd.DataFrame({"x1": [inner["x"][0]], "x2": [inner["x"][1]], "y1": [inner["y"][0]], "y2": [inner["y"][1]]})).mark_rect(
+            color="#60a5fa", fillOpacity=0.15, stroke="#60a5fa", strokeWidth=2, strokeDash=[6, 4]).encode(x="x1:Q", x2="x2:Q", y="y1:Q", y2="y2:Q"))
+    return _dark(alt.layer(*layers), 420)
 
 
 # ============================================================
-# 1-2. 제조업 품질 분석 함수 (Tab 3 품질 분석): 전장 구간별 합격률 / 공정능력 / 분포 / 상관 / 관리도
+# 1-2. 제조업 품질 분석 함수 (Tab 4 품질 분석): 전장 구간별 합격률 / 공정능력 / 분포 / 상관 / 관리도
 #   - 차트는 Streamlit 에 기본 포함된 Altair 로 그린다 (별도 패키지 설치 불필요).
 #   - 차트 안의 필드 이름은 일부러 영문(ASCII)으로 쓴다 (Vega 표현식에서 한글 식별자 오류 방지).
 # ============================================================
@@ -883,12 +999,12 @@ with st.sidebar:
 # 상단 탭
 # ------------------------------------------------------------------
 if st.session_state.get("is_owner"):
-    NAV_ITEMS = ["Tab 1. 스펙 만족 시료 Min/Max 분석", "Tab 2. 시료 확인", "Tab 3. 품질 분석",
+    NAV_ITEMS = ["Tab 1. 스펙 만족 시료 Min/Max 분석", "Tab 2. 시료 확인", "Tab 3. Go/No-Go 게이지 설계", "Tab 4. 품질 분석",
                  "처리 이력 · 통계", "분석 설정 관리", "참고 / 한계 사항"]
-    tab_main, tab_samples, tab_analysis, tab_history, tab_sync, tab_help = st.tabs(NAV_ITEMS)
+    tab_main, tab_samples, tab_gauge, tab_analysis, tab_history, tab_sync, tab_help = st.tabs(NAV_ITEMS)
 else:
-    tab_main, tab_samples, tab_analysis = st.tabs(
-        ["Tab 1. 스펙 만족 시료 Min/Max 분석", "Tab 2. 시료 확인", "Tab 3. 품질 분석"])
+    tab_main, tab_samples, tab_gauge, tab_analysis = st.tabs(
+        ["Tab 1. 스펙 만족 시료 Min/Max 분석", "Tab 2. 시료 확인", "Tab 3. Go/No-Go 게이지 설계", "Tab 4. 품질 분석"])
     tab_history = tab_sync = tab_help = None
 
 
@@ -939,7 +1055,10 @@ with tab_main:
             summary, subset, status_df = analyze_spec(df, _specs, list(_var_rules))
             update_progress("전장 · 일자-Y 합격 보장 범위를 찾는 중...")
             _vk = list(_var_rules)
-            win = find_pass_window(df, pass_matrix(df, _specs)["전체"].values, _vk[0], _vk[1]) if len(_vk) >= 2 else None
+            _flags = pass_matrix(df, _specs)["전체"].values
+            win = find_pass_window(df, _flags, _vk[0], _vk[1]) if len(_vk) >= 2 else None
+            update_progress("허용 불합격률별 범위를 비교하는 중...")
+            trade = window_tradeoff(df, _flags, _vk[0], _vk[1]) if win is not None else []
 
             update_progress("결과 파일 만드는 중...")
             spec_txt = " / ".join(f"{k} {min(v):g}~{max(v):g}" for k, v in _specs.items())
@@ -950,7 +1069,7 @@ with tab_main:
             st.session_state["mm_result"] = {
                 "summary": summary, "subset": subset, "status": status_df, "specs": _specs, "spec_txt": spec_txt,
                 "var_keys": list(_var_rules), "cols": cols, "info": info, "file": _file_name, "sheet": sheet_name,
-                "df": df, "nominals": {k: _last_number(cols[k]["header"]) for k in _var_rules}, "window": win,
+                "df": df, "nominals": {k: _last_number(cols[k]["header"]) for k in _var_rules}, "window": win, "tradeoff": trade,
                 "xlsx": build_result_xlsx(summary, status_df, subset, params, win) if not subset.empty else None,
             }
 
@@ -1117,7 +1236,101 @@ def _spec_lines_for(r, k):
     return lines
 
 
-# ---------------- Tab 3. 품질 분석 (아코디언 5개, 기본은 모두 닫힘) ----------------
+# ---------------- Tab 3. Go/No-Go 게이지 설계 ----------------
+with tab_gauge:
+    r = _analysis_result()
+    if r is not None:
+        trade = r.get("tradeoff")
+        if not trade:
+            st.info("합격 시료가 없거나 이전 버전의 결과입니다. Tab 1 에서 'Min/Max 분석 실행'을 다시 눌러주세요.")
+        else:
+            df_all = r["df"]
+            flags_all = pass_matrix(df_all, r["specs"])["전체"].values
+            xk, yk = trade[0]["xkey"], trade[0]["ykey"]
+
+            st.markdown('<div class="block-title">① 허용 불합격률별 범위 비교</div>', unsafe_allow_html=True)
+            st.caption(f"{xk} 범위와 {yk} 범위를 동시에 만족하는 시료 중 불합격이 차지하는 비율을 일정 수준까지 허용했을 때, "
+                       "범위가 얼마나 넓어지고 게이지 통과율이 얼마나 올라가는지 비교합니다. "
+                       "허용률 0% 는 불합격이 하나도 없는 범위(Tab 1 ①)입니다.")
+            rows = []
+            for w in trade:
+                rows.append({
+                    "허용 불합격률(%)": w["rate"] * 100,
+                    f"{xk} 하한": w["x"][0], f"{xk} 상한": w["x"][1], f"{yk} 하한": w["y"][0], f"{yk} 상한": w["y"][1],
+                    "범위 안 시료 수": w["n_in"], "그 중 불합격": w["n_fail_in"],
+                    "실제 불합격률(%)": w["n_fail_in"] / w["n_in"] * 100 if w["n_in"] else 0.0,
+                    "합격 시료 포함률(%)": w["n_pass_in"] / w["n_pass"] * 100,
+                    "게이지 통과율(%)": w["n_in"] / w["n_total"] * 100,
+                })
+            tdf = pd.DataFrame(rows)
+            cfg = {c: st.column_config.NumberColumn(format="%.4f") for c in tdf.columns if c.endswith(("하한", "상한"))}
+            cfg.update({c: st.column_config.NumberColumn(format="%.1f") for c in ("허용 불합격률(%)", "실제 불합격률(%)", "합격 시료 포함률(%)", "게이지 통과율(%)")})
+            st.dataframe(tdf, use_container_width=True, hide_index=True, column_config=cfg)
+
+            long = pd.concat([
+                pd.DataFrame({"rate": tdf["허용 불합격률(%)"].map(lambda v: f"{v:g}%"), "metric": "합격 시료 포함률", "v": tdf["합격 시료 포함률(%)"]}),
+                pd.DataFrame({"rate": tdf["허용 불합격률(%)"].map(lambda v: f"{v:g}%"), "metric": "실제 불합격률", "v": tdf["실제 불합격률(%)"]}),
+            ])
+            tb = alt.Chart(long).mark_bar().encode(
+                x=alt.X("rate:N", sort=None, title="허용 불합격률", axis=alt.Axis(labelAngle=0)),
+                xOffset="metric:N", y=alt.Y("v:Q", title="%"),
+                color=alt.Color("metric:N", title=None, scale=alt.Scale(domain=["합격 시료 포함률", "실제 불합격률"], range=[SUCCESS, DANGER])),
+                tooltip=[alt.Tooltip("rate:N", title="허용률"), alt.Tooltip("metric:N", title="구분"), alt.Tooltip("v:Q", format=".1f", title="%")])
+            st.altair_chart(_dark(tb, 260), use_container_width=True, theme=None)
+            st.caption("허용률을 높이면 합격 시료를 더 많이 포함(양품 손실↓)하지만, 게이지를 통과한 부품 중 불합격이 섞이는 비율(불량 유출)이 늘어납니다.")
+
+            labels = [f"허용 {w['rate'] * 100:g}% — {xk} {w['x'][0]:.3f}~{w['x'][1]:.3f} · {yk} {w['y'][0]:.3f}~{w['y'][1]:.3f} "
+                      f"(시료 {w['n_in']}개, 불합격 {w['n_fail_in']}개)" for w in trade]
+            pick = st.selectbox("게이지 설계에 사용할 범위", labels, index=0, key="gauge_pick")
+            win = trade[labels.index(pick)]
+
+            st.markdown("<hr>", unsafe_allow_html=True)
+            st.markdown('<div class="block-title">② 게이지 공차 반영 — GO/NO-GO 설계 치수</div>', unsafe_allow_html=True)
+            st.caption("게이지 제작 공차 영역을 합격 범위 '안쪽'에 두어, 게이지가 공차 한계로 만들어져도 범위 밖 부품은 통과시키지 않도록 "
+                       "설계 치수를 안쪽으로 줄입니다 (작업 공차 안쪽 배치 방식).")
+            g1, g2 = st.columns(2)
+            pct = g1.number_input("게이지 제작 공차 (범위 폭 대비 %)", min_value=0.0, max_value=45.0, value=10.0, step=1.0, key="gauge_pct")
+            wear = g2.number_input("마모 여유 (범위 폭 대비 %)", min_value=0.0, max_value=45.0, value=0.0, step=1.0, key="gauge_wear")
+            m1, m2 = st.columns(2)
+            mm_x = m1.number_input(f"{xk} 제작 공차 직접 입력 (mm, 비우면 % 적용)", value=None, min_value=0.0, step=0.001, format="%.4f", key="gauge_mm_x")
+            mm_y = m2.number_input(f"{yk} 제작 공차 직접 입력 (mm, 비우면 % 적용)", value=None, min_value=0.0, step=0.001, format="%.4f", key="gauge_mm_y")
+
+            design = gauge_design(win, pct, wear, {xk: mm_x, yk: mm_y})
+            dcfg = {c: st.column_config.NumberColumn(format="%.4f") for c in
+                    ("합격 범위 하한", "합격 범위 상한", "범위 폭", "제작 공차(mm)", "마모 여유(mm)", "하한측 설계 치수", "상한측 설계 치수", "게이지 통과 폭")}
+            st.dataframe(design, use_container_width=True, hide_index=True, column_config=dcfg)
+
+            if not design["설계 가능"].all():
+                st.error("제작 공차와 마모 여유의 합이 합격 범위 폭의 절반 이상이라 설계할 수 없습니다. 공차를 줄이거나 더 넓은 범위(허용률 상향)를 선택하세요.")
+            else:
+                xr = (float(design.loc[0, "하한측 설계 치수"]), float(design.loc[0, "상한측 설계 치수"]))
+                yr = (float(design.loc[1, "하한측 설계 치수"]), float(design.loc[1, "상한측 설계 치수"]))
+                chk = gauge_check(df_all, flags_all, xk, yk, xr, yr)
+                loss_pct = chk["n_pass_lost"] / chk["n_pass"] * 100 if chk["n_pass"] else 0
+                st.markdown('<div class="block-title">③ 이 게이지로 판정한 결과 (이번 시료 기준)</div>', unsafe_allow_html=True)
+                c1, c2, c3, c4 = st.columns(4)
+                c1.markdown(_kpi("게이지 통과(GO)", f"{chk['n_go']}개", f"전체의 {chk['n_go'] / chk['n_total'] * 100:.1f}%"), unsafe_allow_html=True)
+                c2.markdown(_kpi("통과품 중 불합격(유출)", f"{chk['n_go_fail']}개",
+                                 f"통과품의 {chk['n_go_fail'] / chk['n_go'] * 100 if chk['n_go'] else 0:.1f}%",
+                                 color=SUCCESS if chk["n_go_fail"] == 0 else WARNING), unsafe_allow_html=True)
+                c3.markdown(_kpi("양품인데 NG 판정", f"{chk['n_pass_lost']}개", f"양품의 {loss_pct:.1f}%"), unsafe_allow_html=True)
+                c4.markdown(_kpi("게이지 통과 폭", f"{design.loc[0, '게이지 통과 폭']:.3f} / {design.loc[1, '게이지 통과 폭']:.3f}", f"{xk} / {yk} (mm)"), unsafe_allow_html=True)
+                st.altair_chart(window_scatter_chart(df_all, flags_all, win, {"x": xr, "y": yr}), use_container_width=True, theme=None)
+                st.caption("흰색 사각형은 선택한 합격 범위, 파란 점선 사각형은 게이지 공차를 반영한 설계 범위입니다. "
+                           "측정 불확도(측정기 오차)와 온도 영향은 반영하지 않았으니 실제 제작 전에 별도로 검토하세요.")
+
+                params = {"데이터 파일": r["file"], "선택한 범위": pick, "게이지 제작 공차(%)": pct, "마모 여유(%)": wear,
+                          f"{xk} 제작 공차 직접 입력(mm)": mm_x, f"{yk} 제작 공차 직접 입력(mm)": mm_y}
+                st.download_button(
+                    "게이지_설계_결과.xlsx 다운로드",
+                    data=build_gauge_xlsx(tdf, design, chk, params),
+                    file_name="게이지_설계_결과.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                )
+
+
+# ---------------- Tab 4. 품질 분석 (아코디언 5개, 기본은 모두 닫힘) ----------------
 with tab_analysis:
     r = _analysis_result()
     if r is not None:
@@ -1399,7 +1612,10 @@ if tab_help is not None:
   (예: -0.8872)은 쓰지 않습니다.
 - **일자-Y**는 2행 머리글 `3-1 일자 Y 219.66` 열입니다 (`3-2 휨 Y`는 다른 항목이라 포함하지 않습니다).
 - **Tab 2 (시료 확인)**: 스펙을 모두 만족한 시료 전체 표(전장 오름차순)와, 엑셀 머리글에서 인식한 열 정보를 함께 보여줍니다.
-- **Tab 3 (품질 분석)**: Tab 1 에서 분석을 실행하면 같은 데이터로 아래 5개 분석을 볼 수 있습니다. 각 항목은 아코디언이며 기본은 닫혀 있습니다.
+- **Tab 3 (Go/No-Go 게이지 설계)**: ① 허용 불합격률(0~5%)별로 전장·일자-Y 범위를 비교하고(허용률을 올리면 범위가 넓어지는 대신 통과품에 불합격이 섞임),
+  선택한 범위에 ② 게이지 제작 공차(범위 폭 대비 %, 또는 mm 직접 입력)와 마모 여유를 안쪽으로 반영해 GO/NO-GO 설계 치수를 계산하고,
+  ③ 그 게이지로 이번 시료를 판정한 결과(통과·유출·양품 NG)를 보여줍니다. 측정 불확도와 온도 영향은 반영하지 않습니다.
+- **Tab 4 (품질 분석)**: Tab 1 에서 분석을 실행하면 같은 데이터로 아래 5개 분석을 볼 수 있습니다. 각 항목은 아코디언이며 기본은 닫혀 있습니다.
   - 전장 구간별 합격률: 전장을 구간으로 나눠 합격률을 보고, 목표 합격률을 만족하는 '권장 전장 하한'을 찾습니다.
   - 공정능력 (Cpk): 규격이 있는 타겟 3개(위치도 2종, 윤곽도)의 Cpk(=Cpu), 백분위 방식 Cpk, 예상 불량 PPM. 전장·일자-Y 는 기하공차 관련
     관리 변수라 규격이 없어 제외합니다. 규격 밖이 잘려 나간 합격 시료만으로는 능력이 과대평가되니 전체 기준을 우선 보세요.
