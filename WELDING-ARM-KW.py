@@ -138,115 +138,38 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
 # ============================================================
-# 0-1. 로그인 / Google Sheets 임시비밀번호 인프라 (BA-CAPA와 동일한 방식 재사용)
+# 0-1. 로그인 (관리자: OWNER_PASSWORD / 사용자: secrets.toml 의 user_password)
+#   - 사용자 비밀번호는 secrets.toml 에 `user_password = "..."` 로 넣는다 (여러 개면 리스트).
+#   - 관리자가 그 줄을 지우거나 바꾸면 이후 사용자 로그인은 막힌다 (관리자 로그인은 항상 가능).
+#     이미 로그인해서 쓰고 있는 사용자는 브라우저를 새로고침/재접속할 때부터 막힌다.
+#   - secrets.toml 자체가 없거나 user_password 가 비어 있으면 사용자 로그인은 전부 거부된다.
 # ============================================================
-TEMP_PWD_WORKSHEET = "temp_pwd_store"
+import hmac
 
 
-def _gsheet_available() -> bool:
-    return "gcp_service_account" in st.secrets and "temp_pwd_sheet_id" in st.secrets
-
-
-def _get_gspread_client():
-    if "gcp_service_account" not in st.secrets:
-        return None
+def _user_passwords() -> list:
     try:
-        import gspread
-        from google.oauth2.service_account import Credentials
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=scopes)
-        return gspread.authorize(creds)
+        cfg = st.secrets.get("user_password", "")
     except Exception:
-        return None
-
-
-def _get_temp_pwd_worksheet():
-    if not _gsheet_available():
-        return None
-    gc = _get_gspread_client()
-    if gc is None:
-        return None
-    import gspread
-    sh = gc.open_by_key(st.secrets["temp_pwd_sheet_id"])
+        return []
+    if isinstance(cfg, str):
+        cfg = [cfg]
     try:
-        ws = sh.worksheet(TEMP_PWD_WORKSHEET)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=TEMP_PWD_WORKSHEET, rows=200, cols=3)
-        ws.update([["password", "expires", "created"]])
-    return ws
+        return [str(x).strip() for x in cfg if str(x).strip()]
+    except TypeError:
+        return []
 
 
-def load_temp_pwds() -> dict:
-    try:
-        ws = _get_temp_pwd_worksheet()
-        if ws is None:
-            return {}
-        records = ws.get_all_records()
-        st.session_state["_sheets_last_error"] = None
-        result = {}
-        for row in records:
-            pwd = str(row.get("password", "")).strip()
-            if not pwd:
-                continue
-            exp = row.get("expires")
-            cre = row.get("created")
-            result[pwd] = {
-                "expires": datetime.fromisoformat(exp) if exp else None,
-                "created": datetime.fromisoformat(cre) if cre else datetime.now(),
-            }
-        return result
-    except Exception as e:
-        st.session_state["_sheets_last_error"] = f"[로드 실패] {type(e).__name__}: {e}"
-        return {}
-
-
-def save_temp_pwds(pwd_dict: dict) -> bool:
-    """임시 비번 목록을 Google Sheets에 저장.
-    중요: 먼저 새 데이터를 기록해 성공을 확인한 뒤에만 남은 이전 행을 지웁니다."""
-    try:
-        ws = _get_temp_pwd_worksheet()
-        if ws is None:
-            return False
-        rows = [["password", "expires", "created"]]
-        for pwd, info in pwd_dict.items():
-            exp = info.get("expires")
-            cre = info.get("created")
-            rows.append([
-                pwd,
-                exp.isoformat() if isinstance(exp, datetime) else (exp or ""),
-                cre.isoformat() if isinstance(cre, datetime) else (cre or str(datetime.now())),
-            ])
-
-        ws.update(values=rows, range_name="A1")
-
-        existing_row_count = ws.row_count
-        last_needed_row = len(rows)
-        if existing_row_count > last_needed_row:
-            ws.batch_clear([f"A{last_needed_row + 1}:C{existing_row_count}"])
-
-        st.session_state["_sheets_last_error"] = None
-        return True
-    except Exception as e:
-        st.session_state["_sheets_last_error"] = f"[저장 실패] {type(e).__name__}: {e}"
+def check_user_pwd(p: str) -> bool:
+    p = (p or "").strip()
+    if not p:
         return False
-
-
-def check_temp_pwd(p: str) -> bool:
-    fresh = load_temp_pwds()
-    st.session_state["temp_pwd_list"] = fresh
-    info = fresh.get(p)
-    if info is None:
-        return False
-    if info["expires"] is None:
-        return True
-    return datetime.now() < info["expires"]
+    return any(hmac.compare_digest(p.encode("utf-8"), c.encode("utf-8")) for c in _user_passwords())
 
 
 def login_gate():
     if st.session_state.get("authenticated"):
         return True
-    if "temp_pwd_list" not in st.session_state:
-        st.session_state["temp_pwd_list"] = load_temp_pwds() if _gsheet_available() else {}
 
     _, center, _ = st.columns([1, 1.8, 1])
     with center:
@@ -276,10 +199,9 @@ def login_gate():
                 st.session_state["authenticated"] = True
                 st.session_state["is_owner"] = True
                 st.rerun()
-            elif check_temp_pwd(pw):
+            elif check_user_pwd(pw):
                 st.session_state["authenticated"] = True
                 st.session_state["is_owner"] = False
-                st.session_state["logged_temp_pwd"] = pw
                 st.rerun()
             else:
                 st.error("비밀번호가 올바르지 않습니다.")
@@ -670,60 +592,6 @@ with st.sidebar:
                 st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없습니다. 스펙 값을 확인해주세요.")
             else:
                 st.success(f"3개 타겟 스펙을 모두 만족하는 시료 {_res['n_in']}건으로 Min/Max를 계산했습니다. 위쪽 'Tab 1' 에서 확인하세요.")
-
-    if st.session_state.get("is_owner"):
-        st.markdown("---")
-        with st.expander("임시 비밀번호 관리 (오너 전용)", expanded=True):
-            if not _gsheet_available():
-                st.caption("Google Sheets 연동 미설정 - secrets에 gcp_service_account/temp_pwd_sheet_id 필요")
-            else:
-                last_err = st.session_state.get("_sheets_last_error")
-                if last_err:
-                    st.error(last_err)
-
-                pwd_list = st.session_state.get("temp_pwd_list", {})
-                st.caption(f"현재 발급된 임시 비밀번호 {len(pwd_list)}개")
-                for p, info in list(pwd_list.items()):
-                    exp = info.get("expires")
-                    exp_txt = exp.strftime("%Y-%m-%d") if exp else "무기한"
-                    c1, c2 = st.columns([3, 1])
-                    c1.write(f"`{p}` (만료: {exp_txt})")
-                    if c2.button("삭제", key=f"del_{p}"):
-                        pwd_list.pop(p, None)
-                        success = save_temp_pwds(pwd_list)
-                        if success:
-                            st.session_state["temp_pwd_list"] = load_temp_pwds()
-                            st.rerun()
-                        else:
-                            st.error("삭제 내용 저장에 실패했습니다. API 연결 상태를 확인해주세요.")
-
-                st.markdown("---")
-                new_tp = st.text_input("새 임시 비밀번호", key="new_temp_pwd")
-                exp_option = st.selectbox("만료 기간", ["무기한", "1일 (24시간)", "7일", "30일"])
-                if st.button("발급"):
-                    if not new_tp.strip():
-                        st.warning("비밀번호를 입력해 주십시오.")
-                    elif new_tp == OWNER_PASSWORD:
-                        st.error("오너 비밀번호와 동일한 값은 사용할 수 없습니다.")
-                    else:
-                        now_time = datetime.now()
-                        if exp_option == "1일 (24시간)":
-                            exp_date = now_time + timedelta(days=1)
-                        elif exp_option == "7일":
-                            exp_date = now_time + timedelta(days=7)
-                        elif exp_option == "30일":
-                            exp_date = now_time + timedelta(days=30)
-                        else:
-                            exp_date = None
-
-                        pwd_list[new_tp.strip()] = {"expires": exp_date, "created": now_time}
-                        success = save_temp_pwds(pwd_list)
-                        if success:
-                            st.session_state["temp_pwd_list"] = load_temp_pwds()
-                            st.success("발급되었습니다.")
-                            st.rerun()
-                        else:
-                            st.error("저장에 실패했습니다. 구글 시트 권한이나 API 설정을 확인해주세요.")
 
     st.markdown("---")
     if st.button("로그아웃"):
