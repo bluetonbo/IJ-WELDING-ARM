@@ -183,7 +183,7 @@ def login_gate():
                 <div style='text-align:center; margin:0 0 4px 0;'>
                     <span style='display:inline-block; color:{TEXT_MAIN}; font-size:1.35rem; font-weight:600; line-height:1.4; border-bottom:2px solid {ACCENT_BLUE}; padding-bottom:10px;'>타겟 스펙 만족 시료의 전장 · 일자-Y Min / Max 추출</span>
                 </div>
-                <div style='color:{TEXT_MUTED}; font-size:0.82rem; text-align:center; margin-top:12px;'>V2.0</div>
+                <div style='color:{TEXT_MUTED}; font-size:0.82rem; text-align:center; margin-top:12px;'>V1.0</div>
             </div>""",
             unsafe_allow_html=True,
         )
@@ -488,7 +488,7 @@ def render_header():
                 <div style='color:{ACCENT_BLUE};font-size:2.04rem;font-weight:700;letter-spacing:0.02em;margin-bottom:4px;line-height:1.2;'>WELDING ARM 측정 데이터 분석</div>
                 <div style='display:flex;align-items:baseline;gap:10px;margin-bottom:2px;'>
                     <span style='color:{TEXT_MAIN};font-size:1.3rem;font-weight:700;border-bottom:2px solid {ACCENT_BLUE};padding-bottom:2px;'>타겟 스펙 만족 시료의 전장 · 일자-Y Min / Max 추출</span>
-                    <span style='color:{TEXT_MUTED};font-size:0.85rem;'>V2.0</span>
+                    <span style='color:{TEXT_MUTED};font-size:0.85rem;'>V1.0</span>
                 </div>
                 <div style='color:{TEXT_MUTED};font-size:0.85rem;'>
                     상태: <span style='color:{status_color};font-weight:600;'>{status_txt}</span>
