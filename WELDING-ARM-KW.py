@@ -552,15 +552,15 @@ def render_header():
 render_header()
 
 # ------------------------------------------------------------------
-# 사이드바: 데이터 업로드 + 타겟 스펙 입력 + 실행 (+ 오너 전용 임시비밀번호 관리)
+# 사이드바: 측정 데이터 업로드 (분석 조건 입력/실행/결과는 각 분석 탭에서)
 # ------------------------------------------------------------------
 with st.sidebar:
     st.markdown(f"<div style='margin-bottom:6px;'><img src='data:image/png;base64,{ILJIN_LOGO_B64}' style='height:31px;'/></div>", unsafe_allow_html=True)
-    st.caption("용접 암 측정 데이터 → 타겟 스펙 만족 시료의 전장 · 일자-Y Min/Max")
+    st.caption("용접 암 측정 데이터 업로드 → 분석은 위쪽 탭에서")
     st.markdown("---")
 
-    with st.expander("STEP 1 · 데이터 업로드 및 Min/Max 분석", expanded=True):
-        st.markdown('<div class="block-title">STEP 1-1. 측정 데이터 엑셀 업로드 — 파일명 예: DATA-KW</div>', unsafe_allow_html=True)
+    with st.expander("STEP 1 · 측정 데이터 업로드", expanded=True):
+        st.markdown('<div class="block-title">측정 데이터 엑셀 업로드 — 파일명 예: DATA-KW</div>', unsafe_allow_html=True)
         data_file = st.file_uploader("측정 데이터 엑셀 업로드", type=["xlsx"], label_visibility="collapsed", key="data_uploader")
 
         data_bytes, sheet_name = None, None
@@ -573,137 +573,10 @@ with st.sidebar:
                 st.error(f"엑셀을 여는 중 오류가 발생했습니다 (열기 암호가 걸린 파일은 열 수 없습니다): {e}")
                 data_bytes = None
 
-        st.markdown('<div class="block-title">STEP 1-2. 타겟 항목 스펙 (3개 모두 만족)</div>', unsafe_allow_html=True)
-        specs = {}
-        for _key in st.session_state["target_rules"]:
-            _d_lo, _d_hi = DEFAULT_TARGET_SPECS.get(_key, (0.0, 1.0))
-            st.markdown(f"<div style='font-size:0.85rem;color:{TEXT_MUTED};margin-top:4px;'>{_key}</div>", unsafe_allow_html=True)
-            _c1, _c2 = st.columns(2)
-            _lo = _c1.number_input("하한", value=float(_d_lo), step=0.1, format="%.3f", key=f"spec_lo_{_key}")
-            _hi = _c2.number_input("상한", value=float(_d_hi), step=0.1, format="%.3f", key=f"spec_hi_{_key}")
-            specs[_key] = (_lo, _hi)
-        st.caption("하한/상한 경계값도 합격에 포함됩니다. 변수 항목은 전장, 일자-Y 입니다.")
-
         if data_bytes is None:
-            st.info("측정 데이터 엑셀을 업로드하면 실행할 수 있습니다.")
-
-        if st.button("Min/Max 분석 실행", type="primary", disabled=data_bytes is None):
-            _var_rules = dict(st.session_state["var_rules"])
-            _target_rules = dict(st.session_state["target_rules"])
-            _name_pat = st.session_state["name_pattern"]
-            _file_name = data_file.name
-            _specs = dict(specs)
-
-            def _analyze_work(update_progress):
-                update_progress("엑셀 파일을 읽는 중...")
-                raw = _load_raw_sheet(data_bytes, sheet_name)
-                update_progress("타겟/변수 열을 찾고 시료 행만 추리는 중...")
-                df, cols, info = prepare_dataset(raw, _var_rules, _target_rules, _name_pat)
-                update_progress("3개 타겟 스펙을 모두 만족하는 시료를 고르는 중...")
-                summary, subset, status_df = analyze_spec(df, _specs, list(_var_rules))
-
-                update_progress("결과 파일 만드는 중...")
-                spec_txt = " / ".join(f"{k} {min(v):g}~{max(v):g}" for k, v in _specs.items())
-                params = {
-                    "데이터 파일": _file_name, "시트": sheet_name, "타겟 스펙(경계 포함)": spec_txt,
-                    "변수 항목": ", ".join(_var_rules), "유효 시료 수": info["n_samples"], "스펙 합격 시료 수": len(subset),
-                }
-                st.session_state["mm_result"] = {
-                    "summary": summary, "subset": subset, "status": status_df, "specs": _specs, "spec_txt": spec_txt,
-                    "var_keys": list(_var_rules), "cols": cols, "info": info, "file": _file_name, "sheet": sheet_name,
-                    "xlsx": build_result_xlsx(summary, status_df, subset, params) if not subset.empty else None,
-                }
-
-                update_progress("처리 이력 기록하는 중...")
-                hist = st.session_state.setdefault("process_history", [])
-                rec = {"시각": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "구분": "타겟 스펙 합격",
-                       "데이터 파일": _file_name, "조건": spec_txt, "시료 수": len(subset)}
-                if not summary.empty:
-                    for key in _var_rules:
-                        r = summary[(summary["항목"] == key) & (summary["구분"] == "측정값")].iloc[0]
-                        rec[f"{key} Min ~ Max"] = f"{r['Min']:.4f} ~ {r['Max']:.4f}"
-                hist.insert(0, rec)
-                st.session_state.setdefault("spec_counter", Counter()).update([spec_txt])
-                return {"n_in": len(subset), "spec_txt": spec_txt}
-
-            _run_with_progress("analyze", _analyze_work)
-
-        if st.session_state.get("analyze_dialog_result") is not None or \
-                st.session_state.get("analyze_dialog_error") is not None:
-            _err = st.session_state.pop("analyze_dialog_error", None)
-            _res = st.session_state.pop("analyze_dialog_result", None)
-            if _err:
-                _msg, _tb = _err
-                st.error(f"분석 중 오류가 발생했습니다: {_msg}")
-                with st.expander("상세 오류"):
-                    st.code(_tb)
-            elif _res["n_in"] == 0:
-                st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없습니다. 스펙 값을 확인해주세요.")
-            else:
-                st.success(f"3개 타겟 스펙을 모두 만족하는 시료 {_res['n_in']}건으로 Min/Max를 계산했습니다. 위쪽 'Tab 1' 에서 확인하세요.")
-
-    with st.expander("STEP 2 · 전장 범위 일자-X · 휨-X Min/Max", expanded=False):
-        st.caption("STEP 1에서 올린 같은 엑셀을 사용합니다. 전장이 지정 범위 안인 시료의 일자-X, 휨-X Min/Max를 구합니다.")
-        st.markdown('<div class="block-title">STEP 2-1. 전장 범위 (mm)</div>', unsafe_allow_html=True)
-        rg1, rg2 = st.columns(2)
-        rg_lo = rg1.number_input("하한", value=DEFAULT_LEN_LOW, step=0.05, format="%.3f", key="rg_lo")
-        rg_hi = rg2.number_input("상한", value=DEFAULT_LEN_HIGH, step=0.05, format="%.3f", key="rg_hi")
-        st.caption("하한/상한 경계값도 범위에 포함됩니다. 순서를 바꿔 입력해도 자동으로 정렬됩니다.")
-
-        if data_bytes is None:
-            st.info("STEP 1에서 측정 데이터 엑셀을 먼저 업로드해주세요.")
-
-        if st.button("전장 범위 Min/Max 분석 실행", type="primary", disabled=data_bytes is None, key="rg_run"):
-            _rg_rules = dict(st.session_state["range_rules"])
-            _rg_name_pat = st.session_state["name_pattern"]
-            _rg_file = data_file.name
-            _rg_low, _rg_high = rg_lo, rg_hi
-
-            def _range_work(update_progress):
-                update_progress("엑셀 파일을 읽는 중...")
-                raw = _load_raw_sheet(data_bytes, sheet_name)
-                update_progress("일자-X / 휨-X / 전장 열을 찾고 시료 행만 추리는 중...")
-                df, cols, info = prepare_dataset(raw, _rg_rules, {}, _rg_name_pat)
-                update_progress("전장 범위로 필터링하고 Min/Max 계산하는 중...")
-                summary, subset, lo, hi = analyze_range(df, _rg_low, _rg_high)
-
-                update_progress("결과 파일 만드는 중...")
-                params = {
-                    "데이터 파일": _rg_file, "시트": sheet_name, "전장 하한": lo, "전장 상한": hi, "경계 포함": "예",
-                    "유효 시료 수": info["n_samples"], "범위 내 시료 수": len(subset),
-                }
-                st.session_state["range_result"] = {
-                    "summary": summary, "subset": subset, "lo": lo, "hi": hi, "cols": cols, "info": info,
-                    "file": _rg_file, "xlsx": build_range_xlsx(summary, subset, params) if not subset.empty else None,
-                }
-
-                update_progress("처리 이력 기록하는 중...")
-                cond = f"전장 {lo:g} ~ {hi:g}"
-                rec = {"시각": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "구분": "전장 범위",
-                       "데이터 파일": _rg_file, "조건": cond, "시료 수": len(subset)}
-                if not summary.empty:
-                    for key in RANGE_TARGET_KEYS:
-                        r = summary[(summary["항목"] == key) & (summary["구분"] == "측정값")].iloc[0]
-                        rec[f"{key} Min ~ Max"] = f"{r['Min']:.4f} ~ {r['Max']:.4f}"
-                st.session_state.setdefault("process_history", []).insert(0, rec)
-                st.session_state.setdefault("spec_counter", Counter()).update([cond])
-                return {"n_in": len(subset), "lo": lo, "hi": hi}
-
-            _run_with_progress("range_analyze", _range_work)
-
-        if st.session_state.get("range_analyze_dialog_result") is not None or \
-                st.session_state.get("range_analyze_dialog_error") is not None:
-            _err = st.session_state.pop("range_analyze_dialog_error", None)
-            _res = st.session_state.pop("range_analyze_dialog_result", None)
-            if _err:
-                _msg, _tb = _err
-                st.error(f"분석 중 오류가 발생했습니다: {_msg}")
-                with st.expander("상세 오류"):
-                    st.code(_tb)
-            elif _res["n_in"] == 0:
-                st.warning(f"전장 {_res['lo']:g} ~ {_res['hi']:g} 범위 안에 들어오는 시료가 없습니다. 범위를 확인해주세요.")
-            else:
-                st.success(f"전장 {_res['lo']:g} ~ {_res['hi']:g} 범위 내 {_res['n_in']}건으로 Min/Max를 계산했습니다. 위쪽 'Tab 2' 에서 확인하세요.")
+            st.info("측정 데이터 엑셀을 업로드하면 위쪽 분석 탭에서 실행할 수 있습니다.")
+        else:
+            st.caption("업로드 완료 — 분석 조건 입력과 실행은 위쪽 탭(Tab 1, Tab 2)에서 합니다.")
 
     st.markdown("---")
     if st.button("로그아웃"):
@@ -737,9 +610,81 @@ def _cols_table(cols):
 
 
 with tab_main:
+    st.markdown('<div class="block-title">분석 조건 · 타겟 항목 스펙 (3개 모두 만족)</div>', unsafe_allow_html=True)
+    specs = {}
+    _tcols = st.columns(len(st.session_state["target_rules"]))
+    for _holder, _key in zip(_tcols, st.session_state["target_rules"]):
+        with _holder:
+            _d_lo, _d_hi = DEFAULT_TARGET_SPECS.get(_key, (0.0, 1.0))
+            st.markdown(f"<div style='font-size:0.9rem;color:{TEXT_MAIN};font-weight:600;'>{_key}</div>", unsafe_allow_html=True)
+            _c1, _c2 = st.columns(2)
+            _lo = _c1.number_input("하한", value=float(_d_lo), step=0.1, format="%.3f", key=f"spec_lo_{_key}")
+            _hi = _c2.number_input("상한", value=float(_d_hi), step=0.1, format="%.3f", key=f"spec_hi_{_key}")
+            specs[_key] = (_lo, _hi)
+    st.caption("하한/상한 경계값도 합격에 포함됩니다. 변수 항목은 전장, 일자-Y 입니다.")
+
+    if data_bytes is None:
+        st.info("왼쪽 사이드바 STEP 1에서 측정 데이터 엑셀을 먼저 업로드해주세요.")
+
+    if st.button("Min/Max 분석 실행", type="primary", disabled=data_bytes is None, key="spec_run"):
+        _var_rules = dict(st.session_state["var_rules"])
+        _target_rules = dict(st.session_state["target_rules"])
+        _name_pat = st.session_state["name_pattern"]
+        _file_name = data_file.name
+        _specs = dict(specs)
+
+        def _analyze_work(update_progress):
+            update_progress("엑셀 파일을 읽는 중...")
+            raw = _load_raw_sheet(data_bytes, sheet_name)
+            update_progress("타겟/변수 열을 찾고 시료 행만 추리는 중...")
+            df, cols, info = prepare_dataset(raw, _var_rules, _target_rules, _name_pat)
+            update_progress("3개 타겟 스펙을 모두 만족하는 시료를 고르는 중...")
+            summary, subset, status_df = analyze_spec(df, _specs, list(_var_rules))
+
+            update_progress("결과 파일 만드는 중...")
+            spec_txt = " / ".join(f"{k} {min(v):g}~{max(v):g}" for k, v in _specs.items())
+            params = {
+                "데이터 파일": _file_name, "시트": sheet_name, "타겟 스펙(경계 포함)": spec_txt,
+                "변수 항목": ", ".join(_var_rules), "유효 시료 수": info["n_samples"], "스펙 합격 시료 수": len(subset),
+            }
+            st.session_state["mm_result"] = {
+                "summary": summary, "subset": subset, "status": status_df, "specs": _specs, "spec_txt": spec_txt,
+                "var_keys": list(_var_rules), "cols": cols, "info": info, "file": _file_name, "sheet": sheet_name,
+                "xlsx": build_result_xlsx(summary, status_df, subset, params) if not subset.empty else None,
+            }
+
+            update_progress("처리 이력 기록하는 중...")
+            hist = st.session_state.setdefault("process_history", [])
+            rec = {"시각": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "구분": "타겟 스펙 합격",
+                   "데이터 파일": _file_name, "조건": spec_txt, "시료 수": len(subset)}
+            if not summary.empty:
+                for key in _var_rules:
+                    r = summary[(summary["항목"] == key) & (summary["구분"] == "측정값")].iloc[0]
+                    rec[f"{key} Min ~ Max"] = f"{r['Min']:.4f} ~ {r['Max']:.4f}"
+            hist.insert(0, rec)
+            st.session_state.setdefault("spec_counter", Counter()).update([spec_txt])
+            return {"n_in": len(subset), "spec_txt": spec_txt}
+
+        _run_with_progress("analyze", _analyze_work)
+
+    if st.session_state.get("analyze_dialog_result") is not None or \
+            st.session_state.get("analyze_dialog_error") is not None:
+        _err = st.session_state.pop("analyze_dialog_error", None)
+        _res = st.session_state.pop("analyze_dialog_result", None)
+        if _err:
+            _msg, _tb = _err
+            st.error(f"분석 중 오류가 발생했습니다: {_msg}")
+            with st.expander("상세 오류"):
+                st.code(_tb)
+        elif _res["n_in"] == 0:
+            st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없습니다. 스펙 값을 확인해주세요.")
+        else:
+            st.success(f"3개 타겟 스펙을 모두 만족하는 시료 {_res['n_in']}건으로 Min/Max를 계산했습니다. 아래 결과를 확인하세요.")
+
+    st.markdown("<hr>", unsafe_allow_html=True)
     res = st.session_state.get("mm_result")
     if res is None:
-        st.info("왼쪽 사이드바 STEP 1에서 측정 데이터 엑셀을 업로드하고 타겟 스펙을 확인한 뒤 'Min/Max 분석 실행'을 눌러주세요.")
+        st.info("아직 분석 결과가 없습니다. 위에서 타겟 스펙을 확인하고 'Min/Max 분석 실행'을 눌러주세요.")
     else:
         summary, subset, status_df, info = res["summary"], res["subset"], res["status"], res["info"]
         n_all, n_in = info["n_samples"], len(subset)
@@ -807,9 +752,71 @@ with tab_main:
             )
 
 with tab_range:
+    st.markdown('<div class="block-title">분석 조건 · 전장 범위 (mm)</div>', unsafe_allow_html=True)
+    rg1, rg2, _rg_sp = st.columns([1, 1, 2])
+    rg_lo = rg1.number_input("하한", value=DEFAULT_LEN_LOW, step=0.05, format="%.3f", key="rg_lo")
+    rg_hi = rg2.number_input("상한", value=DEFAULT_LEN_HIGH, step=0.05, format="%.3f", key="rg_hi")
+    st.caption("전장이 이 범위 안인 시료의 일자-X, 휨-X Min/Max를 구합니다. 경계값 포함, 하한/상한 순서를 바꿔 입력해도 자동으로 정렬됩니다.")
+
+    if data_bytes is None:
+        st.info("왼쪽 사이드바 STEP 1에서 측정 데이터 엑셀을 먼저 업로드해주세요.")
+
+    if st.button("전장 범위 Min/Max 분석 실행", type="primary", disabled=data_bytes is None, key="rg_run"):
+        _rg_rules = dict(st.session_state["range_rules"])
+        _rg_name_pat = st.session_state["name_pattern"]
+        _rg_file = data_file.name
+        _rg_low, _rg_high = rg_lo, rg_hi
+
+        def _range_work(update_progress):
+            update_progress("엑셀 파일을 읽는 중...")
+            raw = _load_raw_sheet(data_bytes, sheet_name)
+            update_progress("일자-X / 휨-X / 전장 열을 찾고 시료 행만 추리는 중...")
+            df, cols, info = prepare_dataset(raw, _rg_rules, {}, _rg_name_pat)
+            update_progress("전장 범위로 필터링하고 Min/Max 계산하는 중...")
+            summary, subset, lo, hi = analyze_range(df, _rg_low, _rg_high)
+
+            update_progress("결과 파일 만드는 중...")
+            params = {
+                "데이터 파일": _rg_file, "시트": sheet_name, "전장 하한": lo, "전장 상한": hi, "경계 포함": "예",
+                "유효 시료 수": info["n_samples"], "범위 내 시료 수": len(subset),
+            }
+            st.session_state["range_result"] = {
+                "summary": summary, "subset": subset, "lo": lo, "hi": hi, "cols": cols, "info": info,
+                "file": _rg_file, "xlsx": build_range_xlsx(summary, subset, params) if not subset.empty else None,
+            }
+
+            update_progress("처리 이력 기록하는 중...")
+            cond = f"전장 {lo:g} ~ {hi:g}"
+            rec = {"시각": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "구분": "전장 범위",
+                   "데이터 파일": _rg_file, "조건": cond, "시료 수": len(subset)}
+            if not summary.empty:
+                for key in RANGE_TARGET_KEYS:
+                    r = summary[(summary["항목"] == key) & (summary["구분"] == "측정값")].iloc[0]
+                    rec[f"{key} Min ~ Max"] = f"{r['Min']:.4f} ~ {r['Max']:.4f}"
+            st.session_state.setdefault("process_history", []).insert(0, rec)
+            st.session_state.setdefault("spec_counter", Counter()).update([cond])
+            return {"n_in": len(subset), "lo": lo, "hi": hi}
+
+        _run_with_progress("range_analyze", _range_work)
+
+    if st.session_state.get("range_analyze_dialog_result") is not None or \
+            st.session_state.get("range_analyze_dialog_error") is not None:
+        _err = st.session_state.pop("range_analyze_dialog_error", None)
+        _res = st.session_state.pop("range_analyze_dialog_result", None)
+        if _err:
+            _msg, _tb = _err
+            st.error(f"분석 중 오류가 발생했습니다: {_msg}")
+            with st.expander("상세 오류"):
+                st.code(_tb)
+        elif _res["n_in"] == 0:
+            st.warning(f"전장 {_res['lo']:g} ~ {_res['hi']:g} 범위 안에 들어오는 시료가 없습니다. 범위를 확인해주세요.")
+        else:
+            st.success(f"전장 {_res['lo']:g} ~ {_res['hi']:g} 범위 내 {_res['n_in']}건으로 Min/Max를 계산했습니다. 아래 결과를 확인하세요.")
+
+    st.markdown("<hr>", unsafe_allow_html=True)
     rres = st.session_state.get("range_result")
     if rres is None:
-        st.info("왼쪽 사이드바 STEP 1에서 엑셀을 업로드한 뒤, STEP 2에서 전장 범위를 지정하고 '전장 범위 Min/Max 분석 실행'을 눌러주세요.")
+        st.info("아직 분석 결과가 없습니다. 위에서 전장 범위를 확인하고 '전장 범위 Min/Max 분석 실행'을 눌러주세요.")
     else:
         r_summary, r_subset, r_info = rres["summary"], rres["subset"], rres["info"]
         r_all, r_in = r_info["n_samples"], len(r_subset)
@@ -940,7 +947,7 @@ if tab_help is not None:
     st.markdown("""
 - **계산 기준**: 타겟 항목 3개(단축 위치도 0~1.0, 장축 위치도 0~1.0, 단축 윤곽도 0~0.8, 경계 포함)를 **모두 동시에** 만족하는
   시료만 대상으로, 변수 항목 **전장**과 **일자-Y**의 측정값과 편차(엑셀 자체 계산값) 각각의 Min / Max 를 구합니다.
-  타겟 스펙 값은 사이드바에서 바꿀 수 있습니다.
+  타겟 스펙 값은 Tab 1 상단에서 바꿀 수 있습니다.
 - **타겟은 '값' 열 기준**: 위치도/윤곽도 열의 값(예: 0.1128)이 스펙 범위 안인지 봅니다. 바로 옆 열의 편차값
   (예: -0.8872)은 쓰지 않습니다.
 - **Tab 2 (전장 범위)**: 전장이 지정한 범위(기본 274.8 ~ 275.2, 경계 포함) 안인 시료의 **일자-X**, **휨-X** 측정값/편차 Min / Max 를 구합니다. 같은 엑셀·같은 시료 행 규칙을 씁니다.
