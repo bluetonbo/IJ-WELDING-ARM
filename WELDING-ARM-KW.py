@@ -539,10 +539,12 @@ with st.sidebar:
 # 상단 탭
 # ------------------------------------------------------------------
 if st.session_state.get("is_owner"):
-    NAV_ITEMS = ["Tab 1. 스펙 만족 시료 Min/Max 분석", "처리 이력 · 통계", "분석 설정 관리", "참고 / 한계 사항"]
-    tab_main, tab_history, tab_sync, tab_help = st.tabs(NAV_ITEMS)
+    NAV_ITEMS = ["Tab 1. 스펙 만족 시료 Min/Max 분석", "Tab 2. 스펙 합격 시료 전체 보기", "Tab 3. 인식된 열 정보",
+                 "처리 이력 · 통계", "분석 설정 관리", "참고 / 한계 사항"]
+    tab_main, tab_samples, tab_cols, tab_history, tab_sync, tab_help = st.tabs(NAV_ITEMS)
 else:
-    (tab_main,) = st.tabs(["Tab 1. 스펙 만족 시료 Min/Max 분석"])
+    tab_main, tab_samples, tab_cols = st.tabs(
+        ["Tab 1. 스펙 만족 시료 Min/Max 분석", "Tab 2. 스펙 합격 시료 전체 보기", "Tab 3. 인식된 열 정보"])
     tab_history = tab_sync = tab_help = None
 
 
@@ -684,14 +686,6 @@ with tab_main:
         stat_cfg["단독 합격률(%)"] = st.column_config.NumberColumn(format="%.1f")
         st.dataframe(status_df, use_container_width=True, hide_index=True, column_config=stat_cfg)
 
-        if not subset.empty:
-            with st.expander("스펙 합격 시료 전체 보기 (전장 오름차순)"):
-                st.dataframe(subset, use_container_width=True, hide_index=True)
-
-        if res["cols"]:
-            with st.expander("인식된 열 정보"):
-                st.dataframe(_cols_table(res["cols"]), use_container_width=True, hide_index=True)
-
         if res.get("xlsx"):
             st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
             st.download_button(
@@ -701,6 +695,26 @@ with tab_main:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary",
             )
+
+with tab_samples:
+    _r = st.session_state.get("mm_result")
+    if _r is None:
+        st.info("아직 분석 결과가 없습니다. Tab 1에서 타겟 스펙을 확인하고 'Min/Max 분석 실행'을 눌러주세요.")
+    elif _r["subset"].empty:
+        st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없습니다.")
+    else:
+        st.markdown('<div class="block-title">스펙 합격 시료 전체 보기 (전장 오름차순)</div>', unsafe_allow_html=True)
+        st.caption(f"3개 타겟 스펙을 모두 만족하는 시료 {len(_r['subset'])}개 (유효 시료 {_r['info']['n_samples']}개 중) · 조건: {_r['spec_txt']}")
+        st.dataframe(_r["subset"], use_container_width=True, hide_index=True)
+
+with tab_cols:
+    _r = st.session_state.get("mm_result")
+    if _r is None:
+        st.info("아직 분석 결과가 없습니다. Tab 1에서 'Min/Max 분석 실행'을 누르면 인식된 열 정보가 표시됩니다.")
+    else:
+        st.markdown('<div class="block-title">인식된 열 정보</div>', unsafe_allow_html=True)
+        st.caption("엑셀 머리글에서 찾은 변수(전장, 일자-Y)와 타겟(위치도, 윤곽도) 항목의 열 위치입니다.")
+        st.dataframe(_cols_table(_r["cols"]), use_container_width=True, hide_index=True)
 
 if tab_history is not None:
   with tab_history:
