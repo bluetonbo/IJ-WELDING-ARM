@@ -65,7 +65,7 @@ CUSTOM_CSS = f"""
         background-color: {SURFACE}; border-left: 4px solid {WARNING}; padding: 10px 14px;
         border-radius: 4px; margin-bottom: 10px; font-size: 14px; color: {TEXT_MAIN};
     }}
-    .kpi-card {{ background-color: {SURFACE}; border-radius: 6px; padding: 14px 16px; border: 1px solid {BORDER}; }}
+    .kpi-card {{ background-color: {SURFACE}; border-radius: 6px; padding: 14px 16px; border: 1px solid {BORDER}; min-height: 118px; box-sizing: border-box; }}
     .kpi-label {{ font-size: 12px; color: {TEXT_MUTED}; margin: 0 0 4px 0; }}
     .kpi-value {{ font-size: 24px; font-weight: 600; margin: 0; color: {TEXT_MAIN}; }}
 
@@ -645,9 +645,9 @@ with tab_main:
 
         k1, k2, k3, k4 = st.columns(4)
         k1.markdown(_kpi("합격 조건", "3개 타겟 동시 만족", "단축·장축 위치도, 단축 윤곽도"), unsafe_allow_html=True)
-        k2.markdown(_kpi("유효 시료 수", f"{n_all}개"), unsafe_allow_html=True)
-        k3.markdown(_kpi("스펙 합격 시료 수", f"{n_in}개", color=SUCCESS if n_in else WARNING), unsafe_allow_html=True)
-        k4.markdown(_kpi("합격률", f"{pct:.1f}%"), unsafe_allow_html=True)
+        k2.markdown(_kpi("유효 시료 수", f"{n_all}개", "엑셀 시료 행 기준"), unsafe_allow_html=True)
+        k3.markdown(_kpi("스펙 합격 시료 수", f"{n_in}개", "3개 타겟 스펙 모두 만족", color=SUCCESS if n_in else WARNING), unsafe_allow_html=True)
+        k4.markdown(_kpi("합격률", f"{pct:.1f}%", "합격 시료 ÷ 유효 시료"), unsafe_allow_html=True)
 
         notes = []
         if info["n_excluded_non_sample"]:
