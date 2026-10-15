@@ -19,6 +19,7 @@ import base64
 from datetime import datetime, timedelta
 from collections import Counter
 
+import bisect
 import math
 import re as _re
 import numpy as np
@@ -366,10 +367,14 @@ def analyze_spec(df: pd.DataFrame, specs: dict, var_keys):
     return pd.DataFrame(rows), subset, status_df
 
 
-def build_result_xlsx(summary: pd.DataFrame, status_df: pd.DataFrame, subset: pd.DataFrame, params: dict) -> bytes:
+def build_result_xlsx(summary: pd.DataFrame, status_df: pd.DataFrame, subset: pd.DataFrame, params: dict, window=None) -> bytes:
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
-        summary.to_excel(w, sheet_name="Min_Max 요약", index=False)
+        if window is not None:
+            rng, ver = window_frames(window)
+            rng.to_excel(w, sheet_name="합격 보장 범위", index=False)
+            ver.to_excel(w, sheet_name="합격 보장 범위", index=False, startrow=len(rng) + 3)
+        summary.to_excel(w, sheet_name="참고_합격시료 Min_Max", index=False)
         status_df.to_excel(w, sheet_name="타겟 합격 현황", index=False)
         subset.to_excel(w, sheet_name="합격 시료 데이터", index=False)
         pd.DataFrame(list(params.items()), columns=["조건", "값"]).to_excel(w, sheet_name="분석 조건", index=False)
@@ -378,6 +383,78 @@ def build_result_xlsx(summary: pd.DataFrame, status_df: pd.DataFrame, subset: pd
                 header = str(col[0].value or "")
                 ws.column_dimensions[get_column_letter(idx)].width = 60 if header == "파일명" else max(12, len(header) + 4)
     return bio.getvalue()
+
+
+# ---------- 합격 보장 범위 (전장 × 일자-Y) ----------
+def find_pass_window(df: pd.DataFrame, ok_flags, xkey: str, ykey: str):
+    """두 변수(xkey, ykey)의 직사각형 범위 중, '불합격 시료가 하나도 들어오지 않으면서
+    합격 시료를 가장 많이 포함하는' 범위를 정확하게 찾는다.
+
+    -> 결과 범위(x 범위 AND y 범위)에 들어오는 시료는 (관측 데이터 기준) 전부 합격이다.
+    알고리즘: 직사각형의 왼쪽 끝을 합격 시료의 x 값으로 정하고, 오른쪽으로 시료를 하나씩 넣으면서
+    '불합격 y 값 사이의 빈 구간'에 들어간 합격 시료 수를 센다 (O(n^2 log n), 시료 천 개 수준은 1~2초)."""
+    x = df[xkey].to_numpy(dtype=float)
+    y = df[ykey].to_numpy(dtype=float)
+    ok = np.asarray(ok_flags, dtype=bool)
+    n_pass = int(ok.sum())
+    if n_pass == 0:
+        return None
+
+    order = np.lexsort((ok, x))  # x 오름차순, 같은 x 에서는 불합격(False)을 먼저 넣어 경계에서 놓치지 않게 한다
+    xs, ys, oks = x[order], y[order], ok[order]
+    inf = float("inf")
+    best = {"n": 0}
+    for x1 in np.unique(xs[oks]):
+        fy, py = [], []  # 이 x 띠 안의 불합격 y(정렬), 합격 y(정렬)
+        for j in range(int(np.searchsorted(xs, x1, side="left")), len(xs)):
+            yv = float(ys[j])
+            if oks[j]:
+                bisect.insort(py, yv)
+                i = bisect.bisect_left(fy, yv)
+                lo = fy[i - 1] if i > 0 else -inf
+                hi = fy[i] if i < len(fy) else inf
+                cnt = bisect.bisect_left(py, hi) - bisect.bisect_right(py, lo)  # (lo, hi) 사이 합격 시료 수
+                if cnt > best["n"]:
+                    best = {"n": cnt, "x1": float(x1), "x2": float(xs[j]), "lo": lo, "hi": hi}
+            else:
+                bisect.insort(fy, yv)
+    if best["n"] == 0:
+        return None
+
+    inside = ok & (x >= best["x1"]) & (x <= best["x2"]) & (y > best["lo"]) & (y < best["hi"])
+    xr = (float(x[inside].min()), float(x[inside].max()))
+    yr = (float(y[inside].min()), float(y[inside].max()))
+    box = (x >= xr[0]) & (x <= xr[1]) & (y >= yr[0]) & (y <= yr[1])  # 최종 범위 안의 '모든' 시료로 다시 검증
+    return {"xkey": xkey, "ykey": ykey, "x": xr, "y": yr,
+            "n_in": int(box.sum()), "n_pass_in": int((box & ok).sum()), "n_fail_in": int((box & ~ok).sum()),
+            "n_pass": n_pass, "n_total": int(len(df))}
+
+
+def window_frames(win: dict):
+    """엑셀 저장용: (범위 표, 검증 표)."""
+    rng = pd.DataFrame([
+        {"항목": win["xkey"], "Min": win["x"][0], "Max": win["x"][1], "폭(Max-Min)": win["x"][1] - win["x"][0]},
+        {"항목": win["ykey"], "Min": win["y"][0], "Max": win["y"][1], "폭(Max-Min)": win["y"][1] - win["y"][0]},
+    ])
+    ver = pd.DataFrame([{
+        "두 범위에 동시에 들어오는 시료 수": win["n_in"], "그 중 합격": win["n_pass_in"], "그 중 불합격": win["n_fail_in"],
+        "전체 합격 시료 수": win["n_pass"], "합격 시료 포함률(%)": win["n_pass_in"] / win["n_pass"] * 100 if win["n_pass"] else 0.0,
+    }])
+    return rng, ver
+
+
+def window_scatter_chart(df: pd.DataFrame, ok_flags, win: dict):
+    d = pd.DataFrame({"x": df[win["xkey"]].values, "y": df[win["ykey"]].values, "sample": df["시료"].values,
+                      "status": np.where(np.asarray(ok_flags, dtype=bool), "합격", "불합격")})
+    pts = alt.Chart(d).mark_circle(size=30, opacity=0.6).encode(
+        x=alt.X("x:Q", title=win["xkey"], scale=alt.Scale(zero=False)),
+        y=alt.Y("y:Q", title=win["ykey"], scale=alt.Scale(zero=False)),
+        color=alt.Color("status:N", title="합격 여부", scale=alt.Scale(domain=["합격", "불합격"], range=[SUCCESS, DANGER])),
+        tooltip=[alt.Tooltip("sample:N", title="시료"), alt.Tooltip("x:Q", format=".4f", title=win["xkey"]),
+                 alt.Tooltip("y:Q", format=".4f", title=win["ykey"]), alt.Tooltip("status:N", title="합격 여부")])
+    box = alt.Chart(pd.DataFrame({"x1": [win["x"][0]], "x2": [win["x"][1]], "y1": [win["y"][0]], "y2": [win["y"][1]]})).mark_rect(
+        color="#ffffff", fillOpacity=0.10, stroke="#ffffff", strokeWidth=2).encode(x="x1:Q", x2="x2:Q", y="y1:Q", y2="y2:Q")
+    return _dark(alt.layer(pts, box), 420)
 
 
 # ============================================================
@@ -860,6 +937,9 @@ with tab_main:
             df, cols, info = prepare_dataset(raw, _var_rules, _target_rules, _name_pat)
             update_progress("3개 타겟 스펙을 모두 만족하는 시료를 고르는 중...")
             summary, subset, status_df = analyze_spec(df, _specs, list(_var_rules))
+            update_progress("전장 · 일자-Y 합격 보장 범위를 찾는 중...")
+            _vk = list(_var_rules)
+            win = find_pass_window(df, pass_matrix(df, _specs)["전체"].values, _vk[0], _vk[1]) if len(_vk) >= 2 else None
 
             update_progress("결과 파일 만드는 중...")
             spec_txt = " / ".join(f"{k} {min(v):g}~{max(v):g}" for k, v in _specs.items())
@@ -870,18 +950,17 @@ with tab_main:
             st.session_state["mm_result"] = {
                 "summary": summary, "subset": subset, "status": status_df, "specs": _specs, "spec_txt": spec_txt,
                 "var_keys": list(_var_rules), "cols": cols, "info": info, "file": _file_name, "sheet": sheet_name,
-                "df": df, "nominals": {k: _last_number(cols[k]["header"]) for k in _var_rules},
-                "xlsx": build_result_xlsx(summary, status_df, subset, params) if not subset.empty else None,
+                "df": df, "nominals": {k: _last_number(cols[k]["header"]) for k in _var_rules}, "window": win,
+                "xlsx": build_result_xlsx(summary, status_df, subset, params, win) if not subset.empty else None,
             }
 
             update_progress("처리 이력 기록하는 중...")
             hist = st.session_state.setdefault("process_history", [])
             rec = {"시각": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "구분": "타겟 스펙 합격",
                    "데이터 파일": _file_name, "조건": spec_txt, "시료 수": len(subset)}
-            if not summary.empty:
-                for key in _var_rules:
-                    r = summary[(summary["항목"] == key) & (summary["구분"] == "측정값")].iloc[0]
-                    rec[f"{key} Min ~ Max"] = f"{r['Min']:.4f} ~ {r['Max']:.4f}"
+            if win is not None:
+                rec[f"{win['xkey']} 보장범위"] = f"{win['x'][0]:.4f} ~ {win['x'][1]:.4f}"
+                rec[f"{win['ykey']} 보장범위"] = f"{win['y'][0]:.4f} ~ {win['y'][1]:.4f}"
             hist.insert(0, rec)
             st.session_state.setdefault("spec_counter", Counter()).update([spec_txt])
             return {"n_in": len(subset), "spec_txt": spec_txt}
@@ -900,7 +979,7 @@ with tab_main:
         elif _res["n_in"] == 0:
             st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없습니다. 스펙 값을 확인해주세요.")
         else:
-            st.success(f"3개 타겟 스펙을 모두 만족하는 시료 {_res['n_in']}건으로 Min/Max를 계산했습니다. 아래 결과를 확인하세요.")
+            st.success(f"3개 타겟 스펙을 모두 만족하는 시료 {_res['n_in']}건으로 전장 · 일자-Y 합격 보장 범위를 계산했습니다. 아래 결과를 확인하세요.")
 
     st.markdown("<hr>", unsafe_allow_html=True)
     res = st.session_state.get("mm_result")
@@ -908,6 +987,7 @@ with tab_main:
         st.info("아직 분석 결과가 없습니다. 위에서 타겟 스펙을 확인하고 'Min/Max 분석 실행'을 눌러주세요.")
     else:
         summary, subset, status_df, info = res["summary"], res["subset"], res["status"], res["info"]
+        win = res.get("window")
         n_all, n_in = info["n_samples"], len(subset)
         pct = (n_in / n_all * 100) if n_all else 0
 
@@ -925,41 +1005,64 @@ with tab_main:
         if notes:
             st.caption(" · ".join(notes))
 
-        if summary.empty:
-            st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없어 Min/Max를 계산하지 못했습니다.")
+        st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+        st.markdown('<div class="block-title">① 합격 보장 범위 — 전장 · 일자-Y 가 이 범위에 들어오면 3개 타겟 스펙을 모두 만족</div>', unsafe_allow_html=True)
+        if win is None:
+            st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없어 합격 보장 범위를 찾지 못했습니다.")
         else:
-            st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-            st.markdown('<div class="block-title">① 전장 / 일자-Y Min · Max (측정값 기준)</div>', unsafe_allow_html=True)
-            vals = summary[summary["구분"] == "측정값"].set_index("항목")
-            card_cols = st.columns(2 * len(res["var_keys"]))
-            idx = 0
-            for key in res["var_keys"]:
-                for kind in ("Min", "Max"):
-                    r = vals.loc[key]
-                    card_cols[idx].markdown(
-                        _kpi(f"{key} {kind}", f"{r[kind]:.4f}", f"{r[f'{kind} 시료']} (엑셀 {r[f'{kind} 엑셀 행']}행)"),
-                        unsafe_allow_html=True,
-                    )
-                    idx += 1
-
-            st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-            st.markdown('<div class="block-title">② 상세 표 (측정값 · 편차)</div>', unsafe_allow_html=True)
-            num_cfg = {c: st.column_config.NumberColumn(format="%.4f") for c in ("Min", "Max", "Max-Min")}
-            st.dataframe(summary, use_container_width=True, hide_index=True, column_config=num_cfg)
+            xk, yk = win["xkey"], win["ykey"]
+            wc = st.columns(4)
+            for holder, label, val in ((wc[0], f"{xk} Min", win["x"][0]), (wc[1], f"{xk} Max", win["x"][1]),
+                                       (wc[2], f"{yk} Min", win["y"][0]), (wc[3], f"{yk} Max", win["y"][1])):
+                holder.markdown(_kpi(label, f"{val:.4f}"), unsafe_allow_html=True)
+            st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
+            if win["n_fail_in"] == 0:
+                st.success(
+                    f"{xk} {win['x'][0]:.4f} ~ {win['x'][1]:.4f} 이면서 {yk} {win['y'][0]:.4f} ~ {win['y'][1]:.4f} 인 시료는 "
+                    f"{win['n_in']}개이고, 전부 3개 타겟 스펙을 만족합니다 (불합격 0개). "
+                    f"합격 시료 {win['n_pass']}개 중 {win['n_pass_in']}개({win['n_pass_in'] / win['n_pass'] * 100:.1f}%)를 포함합니다.")
+            else:
+                st.warning(f"범위 안에 불합격 시료가 {win['n_fail_in']}개 섞여 있습니다. 데이터를 확인해주세요.")
+            st.caption(
+                f"{xk} 범위와 {yk} 범위를 **동시에** 만족해야 합니다 (둘 중 하나만 범위 안이면 합격이 보장되지 않습니다). "
+                "불합격 시료가 하나도 포함되지 않는 직사각형 범위 중 합격 시료를 가장 많이 포함하는 범위를 찾은 결과이며, "
+                "이번 데이터에서 실제로 측정된 시료 기준입니다. 시료가 추가되면 범위가 달라질 수 있습니다.")
+            st.altair_chart(window_scatter_chart(res["df"], pass_matrix(res["df"], res["specs"])["전체"].values, win),
+                            use_container_width=True, theme=None)
+            st.caption("흰색 사각형이 합격 보장 범위입니다. 초록 점은 합격, 빨간 점은 불합격 시료이며, 사각형 안에는 빨간 점이 없습니다.")
 
         st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-        st.markdown('<div class="block-title">③ 타겟 항목별 합격 현황</div>', unsafe_allow_html=True)
-        st.caption("'단독 합격'은 그 항목 하나만 봤을 때의 합격 수이고, 위 Min/Max는 세 항목을 모두 만족한 시료만 대상으로 합니다.")
+        st.markdown('<div class="block-title">② 타겟 항목별 합격 현황</div>', unsafe_allow_html=True)
+        st.caption("'단독 합격'은 그 항목 하나만 봤을 때의 합격 수입니다.")
         stat_cfg = {c: st.column_config.NumberColumn(format="%.4f") for c in ("전체 실측 Min", "전체 실측 Max")}
         stat_cfg["단독 합격률(%)"] = st.column_config.NumberColumn(format="%.1f")
         st.dataframe(status_df, use_container_width=True, hide_index=True, column_config=stat_cfg)
 
+        if not summary.empty:
+            with st.expander("참고 · 합격 시료 전체의 Min/Max (이 범위 안에는 불합격 시료도 섞여 있음)", expanded=False):
+                st.caption("합격 시료들이 실제로 가졌던 전장·일자-Y 의 최소·최대값입니다. 이 범위 안에 들어와도 합격이 보장되지는 않습니다 "
+                           "(합격 보장 범위는 위 ① 을 사용하세요).")
+                vals = summary[summary["구분"] == "측정값"].set_index("항목")
+                card_cols = st.columns(2 * len(res["var_keys"]))
+                idx = 0
+                for key in res["var_keys"]:
+                    for kind in ("Min", "Max"):
+                        r = vals.loc[key]
+                        card_cols[idx].markdown(
+                            _kpi(f"{key} {kind}", f"{r[kind]:.4f}", f"{r[f'{kind} 시료']} (엑셀 {r[f'{kind} 엑셀 행']}행)"),
+                            unsafe_allow_html=True,
+                        )
+                        idx += 1
+                st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
+                num_cfg = {c: st.column_config.NumberColumn(format="%.4f") for c in ("Min", "Max", "Max-Min")}
+                st.dataframe(summary, use_container_width=True, hide_index=True, column_config=num_cfg)
+
         if res.get("xlsx"):
             st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
             st.download_button(
-                "스펙만족_MinMax_결과.xlsx 다운로드",
+                "스펙만족_범위_결과.xlsx 다운로드",
                 data=res["xlsx"],
-                file_name="스펙만족_MinMax_결과.xlsx",
+                file_name="스펙만족_범위_결과.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary",
             )
@@ -1286,9 +1389,12 @@ if tab_sync is not None:
 if tab_help is not None:
   with tab_help:
     st.markdown("""
-- **계산 기준**: 타겟 항목 3개(단축 위치도 0~1.0, 장축 위치도 0~1.0, 단축 윤곽도 0~0.8, 경계 포함)를 **모두 동시에** 만족하는
-  시료만 대상으로, 변수 항목 **전장**과 **일자-Y**의 측정값과 편차(엑셀 자체 계산값) 각각의 Min / Max 를 구합니다.
+- **계산 기준**: 타겟 항목 3개(단축 위치도 0~1.0, 장축 위치도 0~1.0, 단축 윤곽도 0~0.8, 경계 포함)를 **모두 동시에** 만족하면 합격입니다.
   타겟 스펙 값은 Tab 1 상단에서 바꿀 수 있습니다.
+- **합격 보장 범위 (Tab 1 ①)**: 전장 범위와 일자-Y 범위를 **동시에** 만족하면 3개 타겟 스펙을 모두 만족하도록, 불합격 시료가 하나도 포함되지 않는
+  직사각형 범위 중 합격 시료를 가장 많이 포함하는 범위를 정확히 찾습니다. 이번 데이터에서 실제 측정된 시료 기준이라 시료가 늘면 범위가 바뀔 수 있고,
+  측정하지 않은 다른 요인의 영향은 반영되지 않습니다.
+- **참고용 Min/Max**: 합격 시료 전체의 전장·일자-Y 최소·최대값(Tab 1 하단 접이식)입니다. 이 범위 안에는 불합격 시료도 섞여 있어 합격을 보장하지 않습니다.
 - **타겟은 '값' 열 기준**: 위치도/윤곽도 열의 값(예: 0.1128)이 스펙 범위 안인지 봅니다. 바로 옆 열의 편차값
   (예: -0.8872)은 쓰지 않습니다.
 - **일자-Y**는 2행 머리글 `3-1 일자 Y 219.66` 열입니다 (`3-2 휨 Y`는 다른 항목이라 포함하지 않습니다).
