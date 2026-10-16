@@ -304,7 +304,69 @@ def locate_columns(raw: pd.DataFrame, var_rules: dict, target_rules: dict):
     return header_row, cols
 
 
-def prepare_dataset(raw: pd.DataFrame, var_rules: dict, target_rules: dict, name_pattern: str):
+# ---------- 양 끝단(파이프 기울기)을 포함한 전장 ----------
+# 전장(= 휨 X − 일자 X)은 양쪽 끝단 '중심' 사이의 거리이다. 실제 끝단 파이프는 기울어져 있어서 원주 8점의 Y 값이 서로 다르므로,
+# 지그를 만들 때는 중심 기준 전장에 기울어서 튀어나온 만큼을 더해야 제품이 들어간다.
+#   왼쪽 끝단: Y-값_단1~8 (원주 8점의 Y 좌표, 약 -119)  -> 가장 왼쪽(최외측) = 가장 작은 Y, 안쪽(최내측) = 가장 큰 Y
+#   오른쪽 끝단: Y-값_장1~8 (원주 8점의 Y 좌표, 약 156)  -> 가장 오른쪽(최외측) = 가장 큰 Y, 안쪽(최내측) = 가장 작은 Y
+#   양 끝단 포함 전장 = 오른쪽 최외측 Y − 왼쪽 최외측 Y   (지그 전장 치수의 기준)
+#   양 끝단 안쪽 전장 = 오른쪽 최내측 Y − 왼쪽 최내측 Y   (참고: 양 끝단이 가장 가까워지는 길이)
+DEFAULT_END_RULES = {
+    "왼쪽 끝단": r"Y\s*-?\s*값\s*_?\s*단\s*(\d)",
+    "오른쪽 끝단": r"Y\s*-?\s*값\s*_?\s*장\s*(\d)",
+}
+END_ITEMS = ["전장", "양 끝단 포함 전장", "양 끝단 안쪽 전장", "기울기 증가량", "왼쪽 끝단 최외측 Y", "오른쪽 끝단 최외측 Y"]
+
+
+def locate_end_columns(raw: pd.DataFrame, header_row: int, end_rules: dict) -> dict:
+    """머리글에서 끝단 8점 열을 번호 순서대로 찾는다 (값 열 바로 옆의 편차 열은 머리글이 비어 있어 자동으로 제외된다)."""
+    header = raw.iloc[header_row]
+    out = {}
+    for side, pattern in end_rules.items():
+        rx = _re.compile(pattern)
+        found = []
+        for c in range(1, raw.shape[1]):
+            v = header.iat[c]
+            if isinstance(v, str):
+                m = rx.search(v.replace("\n", " "))
+                if m:
+                    found.append((int(m.group(1)) if m.groups() and m.group(1) and m.group(1).isdigit() else 99, c))
+        out[side] = [c for _, c in sorted(found)]
+    return out
+
+
+def _add_end_extents(out: pd.DataFrame, body: pd.DataFrame, endcols: dict):
+    """시료 표(out)에 끝단 최외측/최내측 Y, 포함 전장, 안쪽 전장, 기울기 증가량 열을 붙이고, 점이 빠진 행(bool 배열)을 돌려준다."""
+    import warnings
+    left = np.column_stack([pd.to_numeric(body.iloc[:, c], errors="coerce").to_numpy(dtype=float) for c in endcols["왼쪽 끝단"]])
+    right = np.column_stack([pd.to_numeric(body.iloc[:, c], errors="coerce").to_numpy(dtype=float) for c in endcols["오른쪽 끝단"]])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # 값이 전부 빈 행은 NaN 으로 처리
+        out["왼쪽 끝단 최외측 Y"] = np.nanmin(left, axis=1)
+        out["왼쪽 끝단 최내측 Y"] = np.nanmax(left, axis=1)
+        out["오른쪽 끝단 최내측 Y"] = np.nanmin(right, axis=1)
+        out["오른쪽 끝단 최외측 Y"] = np.nanmax(right, axis=1)
+    out["양 끝단 포함 전장"] = out["오른쪽 끝단 최외측 Y"] - out["왼쪽 끝단 최외측 Y"]
+    out["양 끝단 안쪽 전장"] = out["오른쪽 끝단 최내측 Y"] - out["왼쪽 끝단 최내측 Y"]
+    out["기울기 증가량"] = out["양 끝단 포함 전장"] - out["전장"]
+    return ~np.isfinite(left).all(axis=1) | ~np.isfinite(right).all(axis=1)
+
+
+def end_extent_summary(sub: pd.DataFrame) -> pd.DataFrame:
+    """합격(OK) 시료에서 끝단 포함 길이들의 Min/Max/평균과 해당 시료."""
+    rows = []
+    for name in END_ITEMS:
+        if name not in sub.columns or sub[name].isna().all():
+            continue
+        s = sub[name]
+        i_min, i_max = s.idxmin(), s.idxmax()
+        rows.append({"항목": name, "Min": s.min(), "Min 시료": sub.at[i_min, "시료"], "Min 엑셀 행": int(sub.at[i_min, "엑셀 행"]),
+                     "Max": s.max(), "Max 시료": sub.at[i_max, "시료"], "Max 엑셀 행": int(sub.at[i_max, "엑셀 행"]),
+                     "평균": s.mean(), "Max-Min": s.max() - s.min()})
+    return pd.DataFrame(rows)
+
+
+def prepare_dataset(raw: pd.DataFrame, var_rules: dict, target_rules: dict, name_pattern: str, end_rules: dict = None):
     """시료 행만 골라 '엑셀 행 / 파일명 / 시료 / 전장 / 일자-Y (+편차) / 타겟 3종' 표로 만든다."""
     header_row, cols = locate_columns(raw, var_rules, target_rules)
     body = raw.iloc[header_row + 1:]
@@ -320,14 +382,22 @@ def prepare_dataset(raw: pd.DataFrame, var_rules: dict, target_rules: dict, name
         if info["dev_col"] is not None:
             out[f"{key} 편차"] = pd.to_numeric(body.iloc[:, info["dev_col"]], errors="coerce").values
 
+    endcols = locate_end_columns(raw, header_row, DEFAULT_END_RULES if end_rules is None else end_rules)
+    has_end = bool(endcols) and all(len(v) > 0 for v in endcols.values())
+    end_incomplete = _add_end_extents(out, body, endcols) if has_end else None
+
     key_cols = list(var_rules) + list(target_rules)
     is_sample = out["파일명"].str.contains(name_pattern, regex=True, na=False)
     has_number = out[key_cols].notna().any(axis=1)
 
+    hdr_row = raw.iloc[header_row]
     info = {
         "header_row_excel": header_row + 1,
         "n_excluded_non_sample": int((~is_sample & has_number).sum()),  # MIN/MAX/AVG 등 숫자가 있는 비시료 행
         "n_incomplete": int((is_sample & out[key_cols].isna().any(axis=1)).sum()),  # 시료인데 값이 빠진 행
+        "has_end": has_end,
+        "end_cols": {side: {"cols": cs, "headers": [str(hdr_row.iat[c]).strip() for c in cs]} for side, cs in endcols.items()} if has_end else {},
+        "n_end_incomplete": int((is_sample.to_numpy() & end_incomplete).sum()) if has_end else 0,
     }
     df = out[is_sample].dropna(subset=key_cols).reset_index(drop=True)
     info["n_samples"] = len(df)
@@ -367,10 +437,12 @@ def analyze_spec(df: pd.DataFrame, specs: dict, var_keys):
     return pd.DataFrame(rows), subset, status_df
 
 
-def build_result_xlsx(summary: pd.DataFrame, status_df: pd.DataFrame, subset: pd.DataFrame, params: dict, window=None) -> bytes:
+def build_result_xlsx(summary: pd.DataFrame, status_df: pd.DataFrame, subset: pd.DataFrame, params: dict, window=None, end_summary=None) -> bytes:
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
         summary.to_excel(w, sheet_name="합격시료 Min_Max", index=False)
+        if end_summary is not None and len(end_summary):
+            end_summary.to_excel(w, sheet_name="양끝단 포함 전장 Min_Max", index=False)
         status_df.to_excel(w, sheet_name="타겟 합격 현황", index=False)
         if window is not None:
             rng, ver = window_frames(window)
@@ -574,7 +646,7 @@ def window_scatter_chart(df: pd.DataFrame, ok_flags, win: dict, inner: dict = No
 
 
 # ============================================================
-# 1-2. 제조업 품질 분석 함수 (Tab 4 품질 분석): 전장 구간별 합격률 / 공정능력 / 분포 / 상관 / 관리도
+# 1-2. 제조업 품질 분석 함수 (Tab 5 품질 분석): 전장 구간별 합격률 / 공정능력 / 분포 / 상관 / 관리도
 #   - 차트는 Streamlit 에 기본 포함된 Altair 로 그린다 (별도 패키지 설치 불필요).
 #   - 차트 안의 필드 이름은 일부러 영문(ASCII)으로 쓴다 (Vega 표현식에서 한글 식별자 오류 방지).
 # ============================================================
@@ -708,8 +780,8 @@ def describe_item(x) -> dict:
             "왜도": skew, "첨도(초과)": kurt, "정규성 p값(JB)": math.exp(-jb / 2)}
 
 
-_LINE_KINDS = ["LSL", "USL", "기준값", "CL", "UCL", "LCL", "목표"]
-_LINE_COLORS = ["#fb7185", "#fb7185", "#10b981", "#10b981", "#a78bfa", "#a78bfa", "#10b981"]  # 규격=분홍, 관리한계=보라 (막대 색과 구분)
+_LINE_KINDS = ["LSL", "USL", "기준값", "CL", "UCL", "LCL", "목표", "Min", "Max"]
+_LINE_COLORS = ["#fb7185", "#fb7185", "#10b981", "#10b981", "#a78bfa", "#a78bfa", "#10b981", "#60a5fa", "#fb7185"]  # 규격=분홍, 관리한계=보라 (막대 색과 구분)
 
 
 def _line_color_scale(kinds=None):
@@ -838,6 +910,283 @@ def imr_charts(order, values, label, st_info, spec_lines=None, window=30):
 
 
 # ============================================================
+# 1-3. 조건 찾기: 입력(전장, 일자-Y) -> 결과(위치도 2종, 윤곽도) 예측 모델, 예측 정확도, 추천 조건, NG 시료 조정
+#   - 모델: 입력 2개로 결과 3개를 각각 회귀 (선형 또는 2차: 곡률 + 상호작용 포함)
+#   - OK 확률: 모델 예측값 + 실제 잔차(오차) 벡터를 재표본해서 '3개 스펙을 동시에' 만족할 확률을 구한다
+#     (결과 3개가 서로 상관돼 있어도 반영되고, 정규분포 가정이 필요 없다)
+#   - 정확도는 모두 교차검증(학습에 쓰지 않은 시료로 평가) 값이다
+# ============================================================
+
+alt.data_transformers.disable_max_rows()  # 히트맵 칸 수가 많아도 그릴 수 있게 (Altair 기본 5000행 제한 해제)
+
+
+def _feat_matrix(x, y, norm, quad):
+    mx, my, sx, sy = norm
+    u = (np.asarray(x, dtype=float) - mx) / sx
+    v = (np.asarray(y, dtype=float) - my) / sy
+    cols = [np.ones_like(u), u, v]
+    if quad:
+        cols += [u * u, v * v, u * v]
+    return np.column_stack(cols)
+
+
+def fit_condition_model(x, y, tm, quad=True):
+    x, y, tm = np.asarray(x, float), np.asarray(y, float), np.asarray(tm, float)
+    norm = (float(x.mean()), float(y.mean()), float(x.std()) or 1.0, float(y.std()) or 1.0)
+    X = _feat_matrix(x, y, norm, quad)
+    beta, *_ = np.linalg.lstsq(X, tm, rcond=None)
+    return {"quad": bool(quad), "norm": norm, "beta": beta, "resid": tm - X @ beta}
+
+
+def predict_condition(model, x, y):
+    return _feat_matrix(x, y, model["norm"], model["quad"]) @ model["beta"]
+
+
+def pok_at(model, x, y, lo, hi):
+    """(x, y) 조건에서 결과 3개가 동시에 스펙 안에 들어올 확률 (잔차 재표본)."""
+    lo, hi = np.asarray(lo, float), np.asarray(hi, float)
+    resid = model["resid"]
+    pred = predict_condition(model, np.ravel(x), np.ravel(y))
+    out = np.empty(len(pred))
+    for s in range(0, len(pred), 400):
+        blk = pred[s:s + 400]
+        ok = np.ones((len(blk), len(resid)), dtype=bool)
+        for t in range(blk.shape[1]):
+            v = blk[:, t][:, None] + resid[None, :, t]
+            ok &= (v >= lo[t]) & (v <= hi[t])
+        out[s:s + 400] = ok.mean(axis=1)
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def cv_condition_model(x, y, tm, lo, hi, quad=True, k=5, seeds=(0, 1, 2)):
+    """k-겹 교차검증 예측 정확도 + OK/NG 분류 정확도 + 확률 보정 표."""
+    x, y, tm = np.asarray(x, float), np.asarray(y, float), np.asarray(tm, float)
+    lo, hi = np.asarray(lo, float), np.asarray(hi, float)
+    n = len(x)
+    rmse = np.zeros(tm.shape[1])
+    pred0 = pok0 = None
+    for si, seed in enumerate(seeds):
+        idx = np.random.default_rng(seed).permutation(n)
+        pred, pok = np.zeros_like(tm), np.zeros(n)
+        for f in np.array_split(idx, k):
+            tr = np.setdiff1d(idx, f)
+            m = fit_condition_model(x[tr], y[tr], tm[tr], quad)
+            pred[f] = predict_condition(m, x[f], y[f])
+            if si == 0:
+                pok[f] = pok_at(m, x[f], y[f], lo, hi)
+        rmse += np.sqrt(((tm - pred) ** 2).mean(axis=0))
+        if si == 0:
+            pred0, pok0 = pred, pok
+    rmse /= len(seeds)
+    sst = ((tm - tm.mean(axis=0)) ** 2).sum(axis=0)
+    r2 = 1 - ((tm - pred0) ** 2).sum(axis=0) / sst
+
+    ok_true = np.all((tm >= lo) & (tm <= hi), axis=1)
+    pred_ok = pok0 >= 0.5
+    tp, tn = int((pred_ok & ok_true).sum()), int((~pred_ok & ~ok_true).sum())
+    fp, fn = int((pred_ok & ~ok_true).sum()), int((~pred_ok & ok_true).sum())
+    n1, n0 = int(ok_true.sum()), int((~ok_true).sum())
+    ranks = pd.Series(pok0).rank().to_numpy()
+    auc = float((ranks[ok_true].sum() - n1 * (n1 + 1) / 2) / (n1 * n0)) if n1 and n0 else float("nan")
+    edges = [0.0, 0.2, 0.4, 0.6, 0.8, 1.000001]
+    cal = []
+    for a, b in zip(edges[:-1], edges[1:]):
+        m = (pok0 >= a) & (pok0 < b)
+        if m.any():
+            cal.append({"예측 OK 확률 구간": f"{a * 100:.0f}~{min(b, 1) * 100:.0f}%", "시료 수": int(m.sum()),
+                        "평균 예측 확률(%)": float(pok0[m].mean() * 100), "실제 OK 비율(%)": float(ok_true[m].mean() * 100)})
+    return {"rmse": rmse, "r2": r2, "sd": tm.std(axis=0), "pred": pred0, "pok": pok0, "ok_true": ok_true,
+            "tp": tp, "tn": tn, "fp": fp, "fn": fn, "auc": auc, "acc": (tp + tn) / n,
+            "ok_recall": tp / n1 if n1 else float("nan"), "ng_recall": tn / n0 if n0 else float("nan"),
+            "calib": pd.DataFrame(cal)}
+
+
+def max_rect(mask):
+    """True 칸으로만 이루어진 가장 넓은 직사각형 (행 시작, 행 끝, 열 시작, 열 끝). 없으면 None."""
+    nr, nc = mask.shape
+    best_area, best = 0, None
+    h = np.zeros(nc, dtype=int)
+    for i in range(nr):
+        h = np.where(mask[i], h + 1, 0)
+        stack = []
+        for j in range(nc + 1):
+            cur = int(h[j]) if j < nc else 0
+            start = j
+            while stack and stack[-1][1] >= cur:
+                s_idx, s_h = stack.pop()
+                area = s_h * (j - s_idx)
+                if area > best_area:
+                    best_area, best = area, (i - s_h + 1, i, s_idx, j - 1)
+                start = s_idx
+            stack.append((start, cur))
+    return best
+
+
+@st.cache_data(show_spinner=False)
+def condition_map(x, y, tm, lo, hi, quad, xlim, ylim, wx, wy, min_n, target, step=0.02):
+    """허용 범위(xlim, ylim) 안의 격자 조건마다 OK 확률(모델)과 주변 실측 시료 수를 구하고,
+    '시료 근거가 충분(min_n 이상)하면서 OK 확률 >= target' 인 칸으로만 이루어진 가장 넓은 직사각형을 찾는다."""
+    x, y, tm = np.asarray(x, float), np.asarray(y, float), np.asarray(tm, float)
+    lo, hi = np.asarray(lo, float), np.asarray(hi, float)
+    model = fit_condition_model(x, y, tm, quad)
+    gx = np.round(np.arange(np.ceil(xlim[0] / step - 1e-9) * step, xlim[1] + 1e-9, step), 6)
+    gy = np.round(np.arange(np.ceil(ylim[0] / step - 1e-9) * step, ylim[1] + 1e-9, step), 6)
+    GX, GY = np.meshgrid(gx, gy, indexing="ij")
+    fx, fy = GX.ravel(), GY.ravel()
+    P = pok_at(model, fx, fy, lo, hi)
+    cnt = np.zeros(len(fx), dtype=int)
+    for s in range(0, len(fx), 800):
+        cnt[s:s + 800] = ((np.abs(fx[s:s + 800, None] - x[None, :]) <= wx + 1e-9) &
+                          (np.abs(fy[s:s + 800, None] - y[None, :]) <= wy + 1e-9)).sum(axis=1)
+    P, cnt = P.reshape(GX.shape), cnt.reshape(GX.shape)
+    supported = cnt >= min_n
+    ok_true = np.all((tm >= lo) & (tm <= hi), axis=1)
+
+    rect = max_rect(supported & (P >= target))
+    rect_info = None
+    if rect is not None:
+        i0, i1, j0, j1 = rect
+        xr, yr = (float(gx[i0]), float(gx[i1])), (float(gy[j0]), float(gy[j1]))
+        inside = (x >= xr[0]) & (x <= xr[1]) & (y >= yr[0]) & (y <= yr[1])
+        rect_info = {"x": xr, "y": yr, "n_cells": int((i1 - i0 + 1) * (j1 - j0 + 1)), "p_min": float(P[i0:i1 + 1, j0:j1 + 1].min()),
+                     "n_real": int(inside.sum()), "ok_real": int(ok_true[inside].sum())}
+
+    # 근거가 충분한 칸 중 OK 확률이 높은 순 (서로 가까운 후보는 건너뛴다)
+    order = np.lexsort((-cnt.ravel(), -P.ravel()))
+    tops = []
+    for o in order:
+        if not supported.ravel()[o]:
+            continue
+        cx, cy = float(fx[o]), float(fy[o])
+        if all(abs(cx - t["전장"]) > 2 * wx or abs(cy - t["일자-Y"]) > 2 * wy for t in tops):
+            near = (np.abs(x - cx) <= wx) & (np.abs(y - cy) <= wy)
+            tops.append({"전장": cx, "일자-Y": cy, "OK 확률(모델, %)": float(P.ravel()[o] * 100), "주변 실측 시료 수": int(near.sum()),
+                         "주변 실측 OK 비율(%)": float(ok_true[near].mean() * 100) if near.any() else float("nan")})
+        if len(tops) >= 5:
+            break
+    pred_top = predict_condition(model, [t["전장"] for t in tops], [t["일자-Y"] for t in tops]) if tops else np.empty((0, tm.shape[1]))
+    return {"gx": gx, "gy": gy, "P": P, "cnt": cnt, "supported": supported, "rect": rect_info, "tops": pd.DataFrame(tops), "pred_top": pred_top,
+            "step": step}
+
+
+@st.cache_data(show_spinner=False)
+def plan_adjustments(x, y, tm, lo, hi, quad, rmse, xlim, ylim, limx, limy, k, scales, step=0.01):
+    """스펙을 벗어난(NG) 시료마다, 허용 범위와 변경 한도 안에서 '가장 적게 바꿔서' 결과 3개가 모두 스펙 안에 들어갈 것으로
+    예측되는 (전장, 일자-Y) 를 찾는다. 시료마다 자기 고유의 오차(잔차)는 그대로 유지된다고 가정하고,
+    스펙 경계에서 k × (교차검증 오차) 만큼 안쪽에 들어오도록 안전 여유를 둔다."""
+    x, y, tm = np.asarray(x, float), np.asarray(y, float), np.asarray(tm, float)
+    lo, hi, rmse = np.asarray(lo, float), np.asarray(hi, float), np.asarray(rmse, float)
+    model = fit_condition_model(x, y, tm, quad)
+    gx = np.round(np.arange(np.ceil(xlim[0] / step - 1e-9) * step, xlim[1] + 1e-9, step), 6)
+    gy = np.round(np.arange(np.ceil(ylim[0] / step - 1e-9) * step, ylim[1] + 1e-9, step), 6)
+    GX, GY = np.meshgrid(gx, gy, indexing="ij")
+    GX, GY = GX.ravel(), GY.ravel()
+    Pg = predict_condition(model, GX, GY)
+    up_m = k * rmse
+    lo_m = np.where(lo > 0, k * rmse, 0.0)  # 0 은 물리적 하한이라 안전 여유를 두지 않는다
+    ok_true = np.all((tm >= lo) & (tm <= hi), axis=1)
+    rows = []
+    for i in np.flatnonzero(~ok_true):
+        pred = Pg + model["resid"][i]
+        feas = (np.abs(GX - x[i]) <= limx + 1e-9) & (np.abs(GY - y[i]) <= limy + 1e-9)
+        for t in range(tm.shape[1]):
+            feas &= (pred[:, t] >= lo[t] + lo_m[t]) & (pred[:, t] <= hi[t] - up_m[t])
+        if feas.any():
+            cand = np.flatnonzero(feas)
+            d = np.hypot((GX[cand] - x[i]) / scales[0], (GY[cand] - y[i]) / scales[1])
+            j = cand[int(np.argmin(d))]
+            rows.append({"idx": int(i), "ok": True, "nx": float(GX[j]), "ny": float(GY[j]), **{f"p{t}": float(pred[j, t]) for t in range(tm.shape[1])}})
+        else:
+            rows.append({"idx": int(i), "ok": False, "nx": np.nan, "ny": np.nan, **{f"p{t}": np.nan for t in range(tm.shape[1])}})
+    plan = pd.DataFrame(rows)
+    plan["pok"] = np.nan
+    good = plan["ok"].to_numpy()
+    if good.any():
+        plan.loc[good, "pok"] = pok_at(model, plan.loc[good, "nx"].to_numpy(), plan.loc[good, "ny"].to_numpy(), lo, hi) * 100
+    return plan
+
+
+def build_cond_xlsx(acc_df, cls_df, calib_df, top_df, rect_df, plan_df, params) -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as w:
+        acc_df.to_excel(w, sheet_name="예측 정확도", index=False)
+        cls_df.to_excel(w, sheet_name="OK_NG 분류 정확도", index=False)
+        calib_df.to_excel(w, sheet_name="확률 보정", index=False)
+        if rect_df is not None:
+            rect_df.to_excel(w, sheet_name="추천 작업 구간", index=False)
+        top_df.to_excel(w, sheet_name="추천 조건 후보", index=False)
+        plan_df.to_excel(w, sheet_name="NG 시료 조정 추천", index=False)
+        pd.DataFrame(list(params.items()), columns=["조건", "값"]).to_excel(w, sheet_name="분석 조건", index=False)
+        for ws in w.book.worksheets:
+            for idx, col in enumerate(ws.iter_cols(min_row=1, max_row=1), start=1):
+                ws.column_dimensions[get_column_letter(idx)].width = max(13, len(str(col[0].value or "")) + 4)
+    return bio.getvalue()
+
+
+def pok_heatmap(cm, min_n, rect=None, pts=None):
+    gx, gy, P, cnt, step = cm["gx"], cm["gy"], cm["P"], cm["cnt"], cm["step"]
+    gxx, gyy = np.meshgrid(gx, gy, indexing="ij")
+    d = pd.DataFrame({"x1": gxx.ravel() - step / 2, "x2": gxx.ravel() + step / 2, "y1": gyy.ravel() - step / 2, "y2": gyy.ravel() + step / 2,
+                      "p": P.ravel() * 100, "n": cnt.ravel(), "cx": gxx.ravel(), "cy": gyy.ravel()})
+    sup, uns = d[d["n"] >= min_n], d[d["n"] < min_n]
+    enc = dict(x=alt.X("x1:Q", title="전장", scale=alt.Scale(zero=False)), x2="x2:Q", y=alt.Y("y1:Q", title="일자-Y", scale=alt.Scale(zero=False)), y2="y2:Q")
+    tip = [alt.Tooltip("cx:Q", format=".2f", title="전장"), alt.Tooltip("cy:Q", format=".2f", title="일자-Y"),
+           alt.Tooltip("p:Q", format=".1f", title="OK 확률(모델, %)"), alt.Tooltip("n:Q", title="주변 실측 시료 수")]
+    layers = []
+    if len(uns):
+        layers.append(alt.Chart(uns).mark_rect(color="#374151", opacity=0.35).encode(**enc, tooltip=tip))
+    if len(sup):
+        layers.append(alt.Chart(sup).mark_rect().encode(
+            **enc, color=alt.Color("p:Q", title="OK 확률(%)", scale=alt.Scale(domain=[0, 50, 100], range=["#7f1d1d", "#f59e0b", "#10b981"])), tooltip=tip))
+    if pts is not None:
+        layers.append(alt.Chart(pts).mark_circle(size=14, opacity=0.5).encode(
+            x="x:Q", y="y:Q", color=alt.Color("status:N", title="실측", scale=alt.Scale(domain=["OK", "NG"], range=["#ffffff", "#ef4444"]))))
+    if rect is not None:
+        layers.append(alt.Chart(pd.DataFrame({"x1": [rect["x"][0] - step / 2], "x2": [rect["x"][1] + step / 2],
+                                              "y1": [rect["y"][0] - step / 2], "y2": [rect["y"][1] + step / 2]})).mark_rect(
+            fillOpacity=0, stroke="#ffffff", strokeWidth=2.5).encode(x="x1:Q", x2="x2:Q", y="y1:Q", y2="y2:Q"))
+    return _dark(alt.layer(*layers), 440)
+
+
+def pred_actual_chart(actual, pred, label, hi_spec):
+    d = pd.DataFrame({"a": np.asarray(actual, float), "p": np.asarray(pred, float)})
+    lo_v, hi_v = float(min(d["a"].min(), d["p"].min())), float(max(d["a"].max(), d["p"].max()))
+    pts = alt.Chart(d).mark_circle(size=26, opacity=0.5, color=ACCENT_BLUE).encode(
+        x=alt.X("p:Q", title=f"예측 {label} (교차검증)", scale=alt.Scale(domain=[lo_v, hi_v])),
+        y=alt.Y("a:Q", title=f"실측 {label}", scale=alt.Scale(domain=[lo_v, hi_v])),
+        tooltip=[alt.Tooltip("p:Q", format=".3f", title="예측"), alt.Tooltip("a:Q", format=".3f", title="실측")])
+    diag = alt.Chart(pd.DataFrame({"x": [lo_v, hi_v], "y": [lo_v, hi_v]})).mark_line(color="#ffffff", strokeDash=[6, 4]).encode(x="x:Q", y="y:Q")
+    lim_v = alt.Chart(pd.DataFrame({"v": [hi_spec]})).mark_rule(color="#fb7185", strokeDash=[6, 4], strokeWidth=2).encode(y="v:Q")
+    lim_h = alt.Chart(pd.DataFrame({"v": [hi_spec]})).mark_rule(color="#fb7185", strokeDash=[6, 4], strokeWidth=2).encode(x="v:Q")
+    return _dark(alt.layer(pts, diag, lim_v, lim_h), 360)
+
+
+def calib_chart(calib):
+    d = calib.rename(columns={"평균 예측 확률(%)": "pred", "실제 OK 비율(%)": "act", "시료 수": "n"})
+    pts = alt.Chart(d).mark_circle(color=SUCCESS, opacity=0.9).encode(
+        x=alt.X("pred:Q", title="예측 OK 확률 (%)", scale=alt.Scale(domain=[0, 100])),
+        y=alt.Y("act:Q", title="실제 OK 비율 (%)", scale=alt.Scale(domain=[0, 100])),
+        size=alt.Size("n:Q", legend=None, scale=alt.Scale(range=[80, 900])),
+        tooltip=[alt.Tooltip("예측 OK 확률 구간:N"), alt.Tooltip("n:Q", title="시료 수"), alt.Tooltip("pred:Q", format=".1f", title="평균 예측(%)"),
+                 alt.Tooltip("act:Q", format=".1f", title="실제 OK(%)")])
+    diag = alt.Chart(pd.DataFrame({"x": [0, 100], "y": [0, 100]})).mark_line(color="#ffffff", strokeDash=[6, 4]).encode(x="x:Q", y="y:Q")
+    return _dark(alt.layer(pts, diag), 300)
+
+
+def adjust_arrow_chart(cur, rec):
+    """현재 조건(빨강) -> 추천 조건(초록) 이동 화살표(선)."""
+    both = pd.concat([cur.assign(kind="현재(NG)"), rec.assign(kind="추천 조건")])
+    seg = alt.Chart(rec.assign(x0=cur["x"].values, y0=cur["y"].values)).mark_rule(color="#9ca3af", opacity=0.55).encode(
+        x="x0:Q", x2="x:Q", y="y0:Q", y2="y:Q")
+    pts = alt.Chart(both).mark_circle(size=34, opacity=0.8).encode(
+        x=alt.X("x:Q", title="전장", scale=alt.Scale(zero=False)), y=alt.Y("y:Q", title="일자-Y", scale=alt.Scale(zero=False)),
+        color=alt.Color("kind:N", title=None, scale=alt.Scale(domain=["현재(NG)", "추천 조건"], range=[DANGER, SUCCESS])),
+        tooltip=[alt.Tooltip("sample:N", title="시료"), alt.Tooltip("x:Q", format=".3f", title="전장"), alt.Tooltip("y:Q", format=".3f", title="일자-Y")])
+    return _dark(alt.layer(seg, pts), 400)
+
+
+# ============================================================
 # 2. UI (원본과 동일한 로그인 → 사이드바 입력 → 상단 탭 구조)
 # ============================================================
 login_gate()
@@ -848,6 +1197,8 @@ if "target_rules" not in st.session_state:
     st.session_state["target_rules"] = dict(DEFAULT_TARGET_RULES)
 if "name_pattern" not in st.session_state:
     st.session_state["name_pattern"] = DEFAULT_NAME_PATTERN
+if "end_rules" not in st.session_state:
+    st.session_state["end_rules"] = dict(DEFAULT_END_RULES)
 
 
 def _run_with_progress(key_prefix: str, work_fn):
@@ -999,12 +1350,12 @@ with st.sidebar:
 # 상단 탭
 # ------------------------------------------------------------------
 if st.session_state.get("is_owner"):
-    NAV_ITEMS = ["Tab 1. 스펙 만족 시료 Min/Max 분석", "Tab 2. 시료 확인", "Tab 3. Go/No-Go 게이지 설계", "Tab 4. 품질 분석",
+    NAV_ITEMS = ["Tab 1. 스펙 만족 시료 Min/Max 분석", "Tab 2. 조건 찾기", "Tab 3. 시료 확인", "Tab 4. Go/No-Go 게이지 설계", "Tab 5. 품질 분석",
                  "처리 이력 · 통계", "분석 설정 관리", "참고 / 한계 사항"]
-    tab_main, tab_samples, tab_gauge, tab_analysis, tab_history, tab_sync, tab_help = st.tabs(NAV_ITEMS)
+    tab_main, tab_cond, tab_samples, tab_gauge, tab_analysis, tab_history, tab_sync, tab_help = st.tabs(NAV_ITEMS)
 else:
-    tab_main, tab_samples, tab_gauge, tab_analysis = st.tabs(
-        ["Tab 1. 스펙 만족 시료 Min/Max 분석", "Tab 2. 시료 확인", "Tab 3. Go/No-Go 게이지 설계", "Tab 4. 품질 분석"])
+    tab_main, tab_cond, tab_samples, tab_gauge, tab_analysis = st.tabs(
+        ["Tab 1. 스펙 만족 시료 Min/Max 분석", "Tab 2. 조건 찾기", "Tab 3. 시료 확인", "Tab 4. Go/No-Go 게이지 설계", "Tab 5. 품질 분석"])
     tab_history = tab_sync = tab_help = None
 
 
@@ -1014,12 +1365,17 @@ def _kpi(label, value, sub="", color=None):
     return f'<div class="kpi-card"><p class="kpi-label">{label}</p><p class="kpi-value"{style}>{value}</p>{sub_html}</div>'
 
 
-def _cols_table(cols):
-    return pd.DataFrame([
+def _cols_table(cols, info=None):
+    rows = [
         {"구분": v["kind"], "항목": k, "인식한 머리글": v["header"], "값 열": get_column_letter(v["value_col"] + 1),
          "편차 열": get_column_letter(v["dev_col"] + 1) if v["dev_col"] is not None else "-"}
         for k, v in cols.items()
-    ])
+    ]
+    for side, d in ((info or {}).get("end_cols") or {}).items():
+        rows.append({"구분": "끝단", "항목": f"{side} 원주 {len(d['cols'])}점",
+                     "인식한 머리글": f"{d['headers'][0]} ~ {d['headers'][-1]}",
+                     "값 열": ", ".join(get_column_letter(c + 1) for c in d["cols"]), "편차 열": "-"})
+    return pd.DataFrame(rows)
 
 
 with tab_main:
@@ -1043,6 +1399,7 @@ with tab_main:
         _var_rules = dict(st.session_state["var_rules"])
         _target_rules = dict(st.session_state["target_rules"])
         _name_pat = st.session_state["name_pattern"]
+        _end_rules = dict(st.session_state["end_rules"])
         _file_name = data_file.name
         _specs = dict(specs)
 
@@ -1050,9 +1407,10 @@ with tab_main:
             update_progress("엑셀 파일을 읽는 중...")
             raw = _load_raw_sheet(data_bytes, sheet_name)
             update_progress("타겟/변수 열을 찾고 시료 행만 추리는 중...")
-            df, cols, info = prepare_dataset(raw, _var_rules, _target_rules, _name_pat)
+            df, cols, info = prepare_dataset(raw, _var_rules, _target_rules, _name_pat, _end_rules)
             update_progress("3개 타겟 스펙을 모두 만족하는 시료를 고르는 중...")
             summary, subset, status_df = analyze_spec(df, _specs, list(_var_rules))
+            end_summary = end_extent_summary(subset) if (info.get("has_end") and not subset.empty) else None
             update_progress("참고용 합격 보장 범위(불합격 0개)를 찾는 중...")
             _vk = list(_var_rules)
             _flags = pass_matrix(df, _specs)["전체"].values
@@ -1069,8 +1427,8 @@ with tab_main:
             st.session_state["mm_result"] = {
                 "summary": summary, "subset": subset, "status": status_df, "specs": _specs, "spec_txt": spec_txt,
                 "var_keys": list(_var_rules), "cols": cols, "info": info, "file": _file_name, "sheet": sheet_name,
-                "df": df, "nominals": {k: _last_number(cols[k]["header"]) for k in _var_rules}, "window": win, "tradeoff": trade,
-                "xlsx": build_result_xlsx(summary, status_df, subset, params, win) if not subset.empty else None,
+                "df": df, "nominals": {k: _last_number(cols[k]["header"]) for k in _var_rules}, "window": win, "tradeoff": trade, "end_summary": end_summary,
+                "xlsx": build_result_xlsx(summary, status_df, subset, params, win, end_summary) if not subset.empty else None,
             }
 
             update_progress("처리 이력 기록하는 중...")
@@ -1081,6 +1439,9 @@ with tab_main:
                 for key in _var_rules:
                     r = summary[(summary["항목"] == key) & (summary["구분"] == "측정값")].iloc[0]
                     rec[f"{key} 최종 Min ~ Max"] = f"{r['Min']:.4f} ~ {r['Max']:.4f}"
+            if end_summary is not None and not end_summary.empty:
+                _e = end_summary[end_summary["항목"] == "양 끝단 포함 전장"].iloc[0]
+                rec["양 끝단 포함 전장 Min ~ Max"] = f"{_e['Min']:.4f} ~ {_e['Max']:.4f}"
             if win is not None:
                 rec[f"{win['xkey']} 보장범위(참고)"] = f"{win['x'][0]:.4f} ~ {win['x'][1]:.4f}"
                 rec[f"{win['ykey']} 보장범위(참고)"] = f"{win['y'][0]:.4f} ~ {win['y'][1]:.4f}"
@@ -1154,18 +1515,50 @@ with tab_main:
             _inbox = res["df"][_xk].between(vals.loc[_xk, "Min"], vals.loc[_xk, "Max"]) & res["df"][_yk].between(vals.loc[_yk, "Min"], vals.loc[_yk, "Max"])
             st.caption(
                 f"참고: 반대로, 이 두 범위에 동시에 들어오는 시료는 {int(_inbox.sum())}개이고 그 중 {int((~_flags[_inbox.values]).sum())}개는 스펙을 만족하지 못한 시료입니다. "
-                "즉 이 범위는 '합격 시료가 존재했던 폭'이며, 범위 안이라고 해서 합격이 보장되지는 않습니다 (보장되는 범위는 아래 ③ 참고).")
+                "즉 이 범위는 '합격 시료가 존재했던 폭'이며, 범위 안이라고 해서 합격이 보장되지는 않습니다 (보장되는 범위는 아래 ④ 참고).")
             num_cfg = {c: st.column_config.NumberColumn(format="%.4f") for c in ("Min", "Max", "Max-Min")}
             st.dataframe(summary, use_container_width=True, hide_index=True, column_config=num_cfg)
 
         st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-        st.markdown('<div class="block-title">② 타겟 항목별 합격 현황</div>', unsafe_allow_html=True)
+        st.markdown('<div class="block-title">② 양 끝단(파이프 기울기)을 포함한 전장 Min / Max — 지그 전장 치수용</div>', unsafe_allow_html=True)
+        esum = res.get("end_summary")
+        if esum is None or esum.empty:
+            st.info("엑셀에서 Y-값_단1~8 / Y-값_장1~8 열을 찾지 못해 계산하지 않았습니다 (분석 설정 관리 탭에서 끝단 열 이름 규칙을 확인할 수 있습니다).")
+        else:
+            ev = esum.set_index("항목")
+            ec = st.columns(4)
+            _lr = ev.loc["양 끝단 포함 전장"]
+            ec[0].markdown(_kpi("포함 전장 Min", f"{_lr['Min']:.4f}", f"{_lr['Min 시료']} (엑셀 {_lr['Min 엑셀 행']}행)"), unsafe_allow_html=True)
+            ec[1].markdown(_kpi("포함 전장 Max", f"{_lr['Max']:.4f}", f"{_lr['Max 시료']} (엑셀 {_lr['Max 엑셀 행']}행)"), unsafe_allow_html=True)
+            if "기울기 증가량" in ev.index:
+                _gr = ev.loc["기울기 증가량"]
+                ec[2].markdown(_kpi("기울기로 늘어난 길이 (평균)", f"+{_gr['평균']:.4f}", "포함 전장 − 전장(중심 기준)"), unsafe_allow_html=True)
+                ec[3].markdown(_kpi("기울기로 늘어난 길이 (최대)", f"+{_gr['Max']:.4f}", f"{_gr['Max 시료']} (엑셀 {_gr['Max 엑셀 행']}행)"), unsafe_allow_html=True)
+            st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
+            _w = res["info"].get("end_cols", {})
+            _nl, _nr = len(_w.get("왼쪽 끝단", {}).get("cols", [])), len(_w.get("오른쪽 끝단", {}).get("cols", []))
+            st.success(
+                f"합격(OK) 시료 {n_in}개 각각에서, 왼쪽 끝단 원주 {_nl}점(Y-값_단) 중 가장 왼쪽 값과 오른쪽 끝단 원주 {_nr}점(Y-값_장) 중 가장 오른쪽 값 사이의 거리"
+                f"(= 전장 + 양쪽 끝단이 기울어서 튀어나온 길이)를 구해, 그 최소 {_lr['Min']:.4f} ~ 최대 {_lr['Max']:.4f} 로 정했습니다. "
+                f"가장 긴 합격 제품이 들어가려면 지그의 전장 방향 치수는 {_lr['Max']:.4f} 이상을 포함해야 합니다.")
+            if res["info"].get("n_end_incomplete"):
+                st.caption(f"끝단 측정점이 일부 비어 있는 시료 {res['info']['n_end_incomplete']}개는 있는 점만으로 계산했습니다.")
+            if len(subset) >= 3:
+                st.altair_chart(hist_chart(subset["양 끝단 포함 전장"], "양 끝단 포함 전장 (합격 시료)", [("Min", float(_lr["Min"])), ("Max", float(_lr["Max"]))]),
+                                use_container_width=True, theme=None)
+            ecfg = {c: st.column_config.NumberColumn(format="%.4f") for c in ("Min", "Max", "평균", "Max-Min")}
+            st.dataframe(esum, use_container_width=True, hide_index=True, column_config=ecfg)
+            st.caption("양 끝단 포함 전장 = 오른쪽 최외측 Y(가장 큰 값) − 왼쪽 최외측 Y(가장 작은 값). '안쪽 전장'은 양 끝단이 가장 가까워지는 길이(오른쪽 최내측 − 왼쪽 최내측)로, "
+                       "지그에 걸림(스토퍼)이 있을 때 참고하세요. 지그 구조에 따라 필요한 치수가 달라질 수 있습니다.")
+
+        st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+        st.markdown('<div class="block-title">③ 타겟 항목별 합격 현황</div>', unsafe_allow_html=True)
         st.caption("'단독 합격'은 그 항목 하나만 봤을 때의 합격 수입니다.")
         stat_cfg = {c: st.column_config.NumberColumn(format="%.4f") for c in ("전체 실측 Min", "전체 실측 Max")}
         stat_cfg["단독 합격률(%)"] = st.column_config.NumberColumn(format="%.1f")
         st.dataframe(status_df, use_container_width=True, hide_index=True, column_config=stat_cfg)
 
-        with st.expander("③ 참고 · 이 범위 안이면 반드시 합격인 더 좁은 범위 (불합격 0개, Go/No-Go 게이지용)", expanded=False):
+        with st.expander("④ 참고 · 이 범위 안이면 반드시 합격인 더 좁은 범위 (불합격 0개, Go/No-Go 게이지용)", expanded=False):
             if win is None:
                 st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없어 범위를 찾지 못했습니다.")
             else:
@@ -1215,7 +1608,7 @@ with tab_samples:
         st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
         st.markdown('<div class="block-title">② 인식된 열 정보</div>', unsafe_allow_html=True)
         st.caption("엑셀 머리글에서 찾은 변수(전장, 일자-Y)와 타겟(위치도, 윤곽도) 항목의 열 위치입니다.")
-        st.dataframe(_cols_table(_r["cols"]), use_container_width=True, hide_index=True)
+        st.dataframe(_cols_table(_r["cols"], _r["info"]), use_container_width=True, hide_index=True)
 
 
 def _analysis_result():
@@ -1250,7 +1643,199 @@ def _spec_lines_for(r, k):
     return lines
 
 
-# ---------------- Tab 3. Go/No-Go 게이지 설계 ----------------
+# ---------------- Tab 2. 조건 찾기 ----------------
+with tab_cond:
+    r = _analysis_result()
+    if r is not None:
+        dfc, specs = r["df"], r["specs"]
+        xk, yk = r["var_keys"][0], r["var_keys"][1]
+        tg = list(specs)
+        xa, ya = dfc[xk].to_numpy(dtype=float), dfc[yk].to_numpy(dtype=float)
+        tm = dfc[tg].to_numpy(dtype=float)
+        lo = np.array([min(specs[k]) for k in tg])
+        hi = np.array([max(specs[k]) for k in tg])
+
+        st.caption(
+            f"{xk}·{yk} 를 입력 변수, {', '.join(tg)} 를 결과값으로 보고, 이번 데이터의 경향으로 '결과가 3개 스펙을 모두 만족하려면 입력을 어떻게 맞춰야 하는지'를 찾습니다. "
+            "① 예측이 얼마나 믿을 만한지 확인하고, ② 스펙을 만족할 가능성이 높은 입력 조건(작업 구간)을 찾고, ③ 현재 NG 시료의 입력을 얼마나 바꾸면 되는지 추정합니다.")
+        mdl = st.radio("예측 모델", ["2차 모델 (곡률 · 상호작용 포함)", "선형 모델"], horizontal=True, key="cond_model")
+        quad = mdl.startswith("2차")
+        cv = cv_condition_model(xa, ya, tm, lo, hi, quad)
+        cv_alt = cv_condition_model(xa, ya, tm, lo, hi, not quad)
+
+        # ---------------- ① 예측 정확도 ----------------
+        st.markdown('<div class="block-title">① 예측 정확도 (학습에 쓰지 않은 시료로 검증한 값)</div>', unsafe_allow_html=True)
+        alt_name = "선형" if quad else "2차"
+        acc_rows = []
+        for t, k in enumerate(tg):
+            acc_rows.append({"결과": k, "스펙 상한": hi[t], "원래 표준편차": cv["sd"][t], "예측 오차 RMSE": cv["rmse"][t],
+                             "RMSE ÷ 스펙 폭(%)": cv["rmse"][t] / (hi[t] - lo[t]) * 100, "설명력 R²": cv["r2"][t],
+                             f"{alt_name} 모델 RMSE (비교)": cv_alt["rmse"][t]})
+        acc_df = pd.DataFrame(acc_rows)
+        acc_cfg = {c: st.column_config.NumberColumn(format="%.3f") for c in ("스펙 상한", "원래 표준편차", "예측 오차 RMSE", f"{alt_name} 모델 RMSE (비교)")}
+        acc_cfg["RMSE ÷ 스펙 폭(%)"] = st.column_config.NumberColumn(format="%.1f")
+        acc_cfg["설명력 R²"] = st.column_config.NumberColumn(format="%.2f")
+        st.dataframe(acc_df, use_container_width=True, hide_index=True, column_config=acc_cfg)
+        st.caption("예측 오차 RMSE 는 새 시료의 결과값을 예측할 때의 평균적인 오차이고, 스펙 폭에 비해 작을수록 믿을 만합니다. "
+                   "설명력 R² 는 입력 두 개로 설명되는 결과 변동의 비율이며, 나머지는 이 데이터에 없는 다른 요인 때문입니다. "
+                   "데이터를 5등분해서 4/5 로 학습하고 나머지 1/5 로 평가하는 것을 반복한 값입니다.")
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.markdown(_kpi("OK/NG 판정 정확도", f"{cv['acc'] * 100:.1f}%", f"전체 {len(xa)}개 중 맞춘 비율"), unsafe_allow_html=True)
+        k2.markdown(_kpi("OK 를 OK 로 맞힘", f"{cv['ok_recall'] * 100:.1f}%", f"실제 OK {cv['tp'] + cv['fn']}개 중 {cv['tp']}개"), unsafe_allow_html=True)
+        k3.markdown(_kpi("NG 를 NG 로 맞힘", f"{cv['ng_recall'] * 100:.1f}%", f"실제 NG {cv['tn'] + cv['fp']}개 중 {cv['tn']}개",
+                         color=WARNING if cv["ng_recall"] < 0.6 else SUCCESS), unsafe_allow_html=True)
+        k4.markdown(_kpi("구분 능력 (AUC)", f"{cv['auc']:.3f}", "0.5=못 가름 · 1.0=완벽"), unsafe_allow_html=True)
+        cm_df = pd.DataFrame({"": ["실제 OK", "실제 NG"], "예측 OK": [cv["tp"], cv["fp"]], "예측 NG": [cv["fn"], cv["tn"]]})
+        c_l, c_r = st.columns([1, 1])
+        with c_l:
+            st.markdown('<div style="margin-top:12px;"></div>', unsafe_allow_html=True)
+            st.dataframe(cm_df, use_container_width=True, hide_index=True)
+            st.caption("예측 OK 확률이 50% 이상이면 OK 로 예측한 결과입니다. NG 를 NG 로 맞히는 비율이 낮으면, 입력만으로는 NG 를 걸러내기 어렵다는 뜻입니다 "
+                       "(다른 요인이 NG 를 만들기 때문). 이 탭은 'OK 가능성이 높은 입력 구간'을 찾는 용도입니다.")
+        with c_r:
+            if len(cv["calib"]):
+                st.altair_chart(calib_chart(cv["calib"]), use_container_width=True, theme=None)
+        if len(cv["calib"]):
+            ccfg = {c: st.column_config.NumberColumn(format="%.1f") for c in ("평균 예측 확률(%)", "실제 OK 비율(%)")}
+            st.dataframe(cv["calib"], use_container_width=True, hide_index=True, column_config=ccfg)
+            st.caption("'예측 OK 확률'이 높은 시료일수록 실제 OK 비율도 높아지는지 확인하는 표입니다 (점이 대각선에 가까울수록 확률을 믿을 수 있음).")
+        sel_t = st.selectbox("예측 vs 실측 그래프 항목", tg, index=tg.index("단축 윤곽도") if "단축 윤곽도" in tg else 0, key="cond_pa_item")
+        ti = tg.index(sel_t)
+        st.altair_chart(pred_actual_chart(tm[:, ti], cv["pred"][:, ti], sel_t, float(hi[ti])), use_container_width=True, theme=None)
+        st.caption("점이 흰 대각선에 가까울수록 예측이 정확합니다. 분홍 점선은 스펙 상한입니다.")
+
+        st.markdown("<hr>", unsafe_allow_html=True)
+
+        # ---------------- ② 추천 조건 ----------------
+        st.markdown('<div class="block-title">② 3개 스펙을 만족할 가능성이 높은 입력 조건 (추천 작업 구간)</div>', unsafe_allow_html=True)
+        xmin_d, xmax_d = float(np.floor(xa.min() * 100) / 100), float(np.ceil(xa.max() * 100) / 100)
+        ymin_d, ymax_d = float(np.floor(ya.min() * 100) / 100), float(np.ceil(ya.max() * 100) / 100)
+        p1, p2, p3, p4 = st.columns(4)
+        target = p1.slider("목표 OK 확률 (%)", 50, 99, 90, key="cond_target")
+        min_n = p2.number_input("최소 근거 시료 수", min_value=1, max_value=500, value=20, step=5, key="cond_minn",
+                                help="조건 주변(아래 창 크기)에 실제로 측정된 시료가 이만큼 이상 있는 곳만 추천합니다 (데이터가 없는 곳을 추측으로 추천하지 않기 위해)")
+        wx = p3.number_input(f"근거 창 {xk} ± (mm)", min_value=0.01, max_value=0.5, value=0.05, step=0.01, format="%.2f", key="cond_wx")
+        wy = p4.number_input(f"근거 창 {yk} ± (mm)", min_value=0.01, max_value=0.5, value=0.05, step=0.01, format="%.2f", key="cond_wy")
+        b1, b2, b3, b4 = st.columns(4)
+        xlo_i = b1.number_input(f"{xk} 하한 (조정 가능 범위)", value=xmin_d, step=0.01, format="%.3f", key="cond_xlo")
+        xhi_i = b2.number_input(f"{xk} 상한", value=xmax_d, step=0.01, format="%.3f", key="cond_xhi")
+        ylo_i = b3.number_input(f"{yk} 하한 (조정 가능 범위)", value=ymin_d, step=0.01, format="%.3f", key="cond_ylo")
+        yhi_i = b4.number_input(f"{yk} 상한", value=ymax_d, step=0.01, format="%.3f", key="cond_yhi")
+        st.caption("조정 가능 범위의 기본값은 이번 데이터에서 실제 측정된 범위입니다. 현장에서 바꿀 수 있는 범위가 더 좁으면 줄여서 입력하세요.")
+
+        if xlo_i >= xhi_i or ylo_i >= yhi_i:
+            st.error("조정 가능 범위의 하한이 상한보다 작아야 합니다.")
+        else:
+            xlim_i, ylim_i = (float(xlo_i), float(xhi_i)), (float(ylo_i), float(yhi_i))
+            cmap = condition_map(xa, ya, tm, lo, hi, quad, xlim_i, ylim_i, float(wx), float(wy), int(min_n), target / 100)
+            rect = cmap["rect"]
+            if rect is None:
+                st.warning(f"OK 확률 {target}% 이상이면서 근거 시료 {int(min_n)}개 이상인 구간이 없습니다. 목표 확률이나 최소 근거 시료 수를 낮춰보세요.")
+            else:
+                q1, q2, q3, q4 = st.columns(4)
+                q1.markdown(_kpi(f"추천 {xk} 구간", f"{rect['x'][0]:.2f} ~ {rect['x'][1]:.2f}", "mm"), unsafe_allow_html=True)
+                q2.markdown(_kpi(f"추천 {yk} 구간", f"{rect['y'][0]:.2f} ~ {rect['y'][1]:.2f}", "mm"), unsafe_allow_html=True)
+                q3.markdown(_kpi("구간 안 최소 OK 확률(모델)", f"{rect['p_min'] * 100:.1f}%", f"모든 칸이 목표 {target}% 이상"), unsafe_allow_html=True)
+                real_rate = rect["ok_real"] / rect["n_real"] * 100 if rect["n_real"] else float("nan")
+                q4.markdown(_kpi("구간 안 실측 시료", f"{rect['n_real']}개 중 {rect['ok_real']}개 OK", f"실측 OK 비율 {real_rate:.1f}%",
+                                 color=SUCCESS if real_rate >= target else WARNING), unsafe_allow_html=True)
+                st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
+                st.success(
+                    f"{xk} {rect['x'][0]:.2f} ~ {rect['x'][1]:.2f} mm, {yk} {rect['y'][0]:.2f} ~ {rect['y'][1]:.2f} mm 로 맞추면 "
+                    f"3개 스펙을 모두 만족할 확률이 모델 기준 {rect['p_min'] * 100:.0f}% 이상입니다. "
+                    f"이번 데이터에서 이 구간에 들어온 실제 시료는 {rect['n_real']}개이고 그 중 {rect['ok_real']}개({real_rate:.1f}%)가 OK 였습니다.")
+            show_pts = st.checkbox("실측 시료 점 표시", value=False, key="cond_show_pts")
+            pts_df = pd.DataFrame({"x": xa, "y": ya, "status": np.where(np.all((tm >= lo) & (tm <= hi), axis=1), "OK", "NG")}) if show_pts else None
+            st.altair_chart(pok_heatmap(cmap, int(min_n), rect, pts_df), use_container_width=True, theme=None)
+            st.caption("칸의 색이 초록일수록 그 입력 조건에서 3개 스펙을 모두 만족할 확률(모델 추정)이 높습니다. 회색 칸은 주변에 실측 시료가 부족해서 "
+                       "추천하지 않는 곳이고, 흰색 사각형이 추천 작업 구간입니다.")
+
+            top_df = cmap["tops"]
+            if len(top_df):
+                for t, k in enumerate(tg):
+                    top_df[f"예측 {k}"] = cmap["pred_top"][:, t]
+                st.markdown('<div class="block-title" style="margin-top:12px;">추천 중심 조건 후보 (OK 확률 높은 순, 서로 떨어진 5곳)</div>', unsafe_allow_html=True)
+                tcfg = {c: st.column_config.NumberColumn(format="%.2f") for c in (xk, yk)}
+                tcfg.update({c: st.column_config.NumberColumn(format="%.1f") for c in ("OK 확률(모델, %)", "주변 실측 OK 비율(%)")})
+                tcfg.update({f"예측 {k}": st.column_config.NumberColumn(format="%.3f") for k in tg})
+                st.dataframe(top_df, use_container_width=True, hide_index=True, column_config=tcfg)
+                st.caption("'주변 실측'은 그 조건 근처(근거 창 안)에서 실제로 측정된 시료의 수와 OK 비율입니다. 모델 확률과 실측 비율이 비슷할수록 믿을 만합니다. "
+                           "이 데이터는 이미 만들어진 시료를 측정한 것이라, 추천 조건으로 시험 시료를 10~20개 만들어 실제 OK 비율을 확인하는 것을 권장합니다.")
+
+            st.markdown("<hr>", unsafe_allow_html=True)
+
+            # ---------------- ③ 현재 시료 조정 ----------------
+            st.markdown('<div class="block-title">③ 현재 NG 시료의 입력 조건을 얼마나 바꾸면 스펙 안에 들어가는가 (추정)</div>', unsafe_allow_html=True)
+            a1, a2, a3 = st.columns(3)
+            limx = a1.number_input(f"{xk} 변경 한도 ± (mm)", min_value=0.0, max_value=3.0, value=1.0, step=0.05, format="%.2f", key="cond_limx",
+                                   help="한 시료에서 바꿀 수 있는 최대 변경량입니다. 현장 제약에 맞게 줄이세요.")
+            limy = a2.number_input(f"{yk} 변경 한도 ± (mm)", min_value=0.0, max_value=3.0, value=0.5, step=0.05, format="%.2f", key="cond_limy")
+            kmargin = a3.slider("안전 여유 (예측 오차의 배수)", 0.0, 2.0, 0.5, 0.25, key="cond_k",
+                                help="결과 예측값이 스펙 경계에서 (예측 오차 × 이 값) 만큼 안쪽에 들어오도록 요구합니다. 클수록 보수적입니다.")
+            prio = st.radio("변경 우선순위", ["균형 (두 입력 모두 조금씩)", f"{xk} 위주로 변경", f"{yk} 위주로 변경"], horizontal=True, key="cond_prio")
+            scales = (0.1, 0.05) if prio.startswith("균형") else ((0.1, 1.0) if prio.startswith(xk) else (1.0, 0.05))
+
+            plan = plan_adjustments(xa, ya, tm, lo, hi, quad, cv["rmse"], xlim_i, ylim_i, float(limx), float(limy), float(kmargin), scales)
+            n_ng = len(plan)
+            if n_ng == 0:
+                st.success("현재 NG 시료가 없습니다.")
+            else:
+                pos = plan["idx"].to_numpy()
+                feas = plan["ok"].to_numpy()
+                dx = plan["nx"].to_numpy() - xa[pos]
+                dy = plan["ny"].to_numpy() - ya[pos]
+                s1, s2, s3, s4 = st.columns(4)
+                s1.markdown(_kpi("현재 NG 시료", f"{n_ng}개", "3개 스펙 중 하나 이상 벗어남"), unsafe_allow_html=True)
+                s2.markdown(_kpi("조정으로 OK 가능(추정)", f"{int(feas.sum())}개", f"NG 의 {feas.mean() * 100:.0f}% · 불가 {int((~feas).sum())}개",
+                                 color=SUCCESS if feas.mean() >= 0.7 else WARNING), unsafe_allow_html=True)
+                s3.markdown(_kpi(f"{xk} 변경량 (중앙값)", f"{np.nanmedian(dx):+.3f} mm" if feas.any() else "-",
+                                 f"사분위 {np.nanpercentile(dx, 25):+.2f} ~ {np.nanpercentile(dx, 75):+.2f}" if feas.any() else ""), unsafe_allow_html=True)
+                s4.markdown(_kpi("변경 후 예상 OK 확률(평균)", f"{np.nanmean(plan['pok']):.1f}%" if feas.any() else "-", "그 조건에서의 일반적인 OK 확률(모델)"), unsafe_allow_html=True)
+
+                view = pd.DataFrame({"시료": dfc["시료"].to_numpy()[pos], "엑셀 행": dfc["엑셀 행"].to_numpy()[pos],
+                                     f"현재 {xk}": xa[pos], f"현재 {yk}": ya[pos]})
+                for t, k in enumerate(tg):
+                    view[f"현재 {k}"] = tm[pos, t]
+                view["불합격 항목"] = [", ".join(k for t, k in enumerate(tg) if not (lo[t] <= tm[i, t] <= hi[t])) for i in pos]
+                view[f"추천 {xk}"], view[f"추천 {yk}"] = plan["nx"].to_numpy(), plan["ny"].to_numpy()
+                view[f"Δ{xk}"], view[f"Δ{yk}"] = dx, dy
+                for t, k in enumerate(tg):
+                    view[f"변경 후 예측 {k}"] = plan[f"p{t}"].to_numpy()
+                view["예상 OK 확률(%)"] = plan["pok"].to_numpy()
+                view["판정"] = np.where(feas, "조정 가능(추정)", "한도 내 조정 불가")
+                vcfg = {c: st.column_config.NumberColumn(format="%.4f") for c in view.columns
+                        if c.startswith(("현재 ", "추천 ", "변경 후")) and c != "현재 NG"}
+                vcfg.update({f"Δ{xk}": st.column_config.NumberColumn(format="%+.3f"), f"Δ{yk}": st.column_config.NumberColumn(format="%+.3f"),
+                             "예상 OK 확률(%)": st.column_config.NumberColumn(format="%.1f")})
+                st.dataframe(view, use_container_width=True, hide_index=True, column_config=vcfg)
+                st.caption("각 시료의 '변경 후 예측' 결과값은 그 시료만의 고유한 편차(다른 요인의 영향)가 그대로 유지된다는 가정으로 계산했습니다. "
+                           "'예상 OK 확률'은 추천 조건에서 일반적인 시료가 스펙을 만족할 확률이라 더 보수적인 값입니다. "
+                           "입력을 바꾸면 결과가 이 데이터의 경향대로 따라 바뀐다는 가정이 필요하므로, 실제 조정 후 재측정으로 확인하세요.")
+                if feas.any():
+                    cur_df = pd.DataFrame({"x": xa[pos][feas], "y": ya[pos][feas], "sample": dfc["시료"].to_numpy()[pos][feas]})
+                    rec_df = pd.DataFrame({"x": plan["nx"].to_numpy()[feas], "y": plan["ny"].to_numpy()[feas], "sample": dfc["시료"].to_numpy()[pos][feas]})
+                    st.altair_chart(adjust_arrow_chart(cur_df, rec_df), use_container_width=True, theme=None)
+                    st.caption("빨간 점이 현재 NG 시료의 입력 조건, 초록 점이 추천 조건이며 회색 선이 이동 방향입니다.")
+
+                rect_df = None
+                if rect is not None:
+                    rect_df = pd.DataFrame([{"전장 하한": rect["x"][0], "전장 상한": rect["x"][1], "일자-Y 하한": rect["y"][0], "일자-Y 상한": rect["y"][1],
+                                             "구간 내 최소 OK 확률(모델,%)": rect["p_min"] * 100, "구간 안 실측 시료 수": rect["n_real"], "그 중 OK": rect["ok_real"]}])
+                cls_df = pd.DataFrame({"": ["실제 OK", "실제 NG"], "예측 OK": [cv["tp"], cv["fp"]], "예측 NG": [cv["fn"], cv["tn"]]})
+                params = {"예측 모델": mdl, "목표 OK 확률(%)": target, "최소 근거 시료 수": int(min_n), f"근거 창 {xk}±": wx, f"근거 창 {yk}±": wy,
+                          f"조정 가능 범위 {xk}": f"{xlo_i} ~ {xhi_i}", f"조정 가능 범위 {yk}": f"{ylo_i} ~ {yhi_i}",
+                          f"변경 한도 {xk}±": limx, f"변경 한도 {yk}±": limy, "안전 여유(오차 배수)": kmargin, "변경 우선순위": prio}
+                st.download_button(
+                    "조건찾기_결과.xlsx 다운로드",
+                    data=build_cond_xlsx(acc_df, cls_df, cv["calib"], top_df, rect_df, view, params),
+                    file_name="조건찾기_결과.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                )
+
+
+# ---------------- Tab 4. Go/No-Go 게이지 설계 ----------------
 with tab_gauge:
     r = _analysis_result()
     if r is not None:
@@ -1265,7 +1850,7 @@ with tab_gauge:
             st.markdown('<div class="block-title">① 허용 불합격률별 범위 비교</div>', unsafe_allow_html=True)
             st.caption(f"{xk} 범위와 {yk} 범위를 동시에 만족하는 시료 중 불합격이 차지하는 비율을 일정 수준까지 허용했을 때, "
                        "범위가 얼마나 넓어지고 게이지 통과율이 얼마나 올라가는지 비교합니다. "
-                       "허용률 0% 는 불합격이 하나도 없는 범위(Tab 1 ③ 참고)입니다.")
+                       "허용률 0% 는 불합격이 하나도 없는 범위(Tab 1 ④ 참고)입니다.")
             rows = []
             for w in trade:
                 rows.append({
@@ -1344,7 +1929,7 @@ with tab_gauge:
                 )
 
 
-# ---------------- Tab 4. 품질 분석 (아코디언 5개, 기본은 모두 닫힘) ----------------
+# ---------------- Tab 5. 품질 분석 (아코디언 5개, 기본은 모두 닫힘) ----------------
 with tab_analysis:
     r = _analysis_result()
     if r is not None:
@@ -1591,13 +2176,16 @@ if tab_sync is not None:
                for k, p in st.session_state["var_rules"].items()}
     new_tgt = {k: st.text_input(f"타겟 '{k}' 라벨 정규식", value=p, key=f"trule_{k}")
                for k, p in st.session_state["target_rules"].items()}
+    new_end = {k: st.text_input(f"{k} 원주 8점 머리글 정규식 (끝에 번호 괄호 하나)", value=p, key=f"erule_{k}")
+               for k, p in st.session_state["end_rules"].items()}
     new_name_pat = st.text_input("시료 행 파일명 패턴 (정규식)", value=st.session_state["name_pattern"], key="rule_name_pattern")
     if st.button("분석 설정 저장"):
         try:
-            for p in list(new_var.values()) + list(new_tgt.values()) + [new_name_pat]:
+            for p in list(new_var.values()) + list(new_tgt.values()) + list(new_end.values()) + [new_name_pat]:
                 _re.compile(p)
             st.session_state["var_rules"] = {k: v.strip() for k, v in new_var.items()}
             st.session_state["target_rules"] = {k: v.strip() for k, v in new_tgt.items()}
+            st.session_state["end_rules"] = {k: v.strip() for k, v in new_end.items()}
             st.session_state["name_pattern"] = new_name_pat.strip()
             st.success("저장되었습니다. 다음 분석부터 적용됩니다.")
         except _re.error as e:
@@ -1620,9 +2208,21 @@ if tab_help is not None:
   타겟 스펙 값은 Tab 1 상단에서 바꿀 수 있습니다.
 - **최종 Min/Max (Tab 1 ①)**: 시료를 하나씩 보고 3개 타겟 스펙을 모두 만족하면 OK 로 분류한 뒤, OK 시료 전체에서 전장·일자-Y 의 가장 작은 값과
   가장 큰 값을 구합니다. OK 시료는 전부 이 범위 안에 들어옵니다. 반대로 이 범위 안에 들어온 시료가 전부 OK 인 것은 아닙니다.
-- **합격 보장 범위 (Tab 1 ③ 참고, Tab 3 게이지 설계)**: 전장 범위와 일자-Y 범위를 **동시에** 만족하면 3개 타겟 스펙을 모두 만족하도록, 불합격 시료가 하나도 포함되지
+- **양 끝단 포함 전장 (Tab 1 ②)**: 전장은 양쪽 끝단 '중심' 사이의 거리(휨 X − 일자 X)이고, 끝단 파이프는 기울어져 있어 원주 8점의 Y 값이 서로 다릅니다.
+  그래서 지그를 만들 때는 전장에 기울어서 튀어나온 길이를 더해야 제품이 들어갑니다. 합격(OK) 시료마다 (오른쪽 끝단 Y-값_장1~8 중 가장 큰 값) − (왼쪽 끝단 Y-값_단1~8 중 가장 작은 값)을
+  '양 끝단 포함 전장'으로 계산하고, 그 최소·최대를 보여줍니다. '안쪽 전장'(양 끝단이 가장 가까워지는 길이)과 기울기로 늘어난 길이도 함께 나옵니다.
+- **합격 보장 범위 (Tab 1 ④ 참고, Tab 4 게이지 설계)**: 전장 범위와 일자-Y 범위를 **동시에** 만족하면 3개 타겟 스펙을 모두 만족하도록, 불합격 시료가 하나도 포함되지
   않는 직사각형 범위 중 합격 시료를 가장 많이 포함하는 범위를 정확히 찾습니다. 이번 데이터에서 실제 측정된 시료 기준이라 시료가 늘면 범위가 바뀔 수 있고,
   측정하지 않은 다른 요인의 영향은 반영되지 않습니다.
+- **Tab 2 (조건 찾기)**: 전장·일자-Y 를 입력, 위치도 2종·윤곽도를 결과로 보고 이번 데이터의 경향으로 '3개 스펙을 만족하려면 입력을 어떻게 맞춰야 하는지'를 찾습니다.
+  ① 예측 정확도(교차검증 오차 RMSE, 설명력 R², OK/NG 판정 정확도, 확률 보정), ② 3개 스펙을 만족할 확률이 목표(기본 90%) 이상이면서 실측 근거 시료가 충분한 입력 구간(추천 작업 구간)과
+  OK 확률 지도, ③ 현재 NG 시료의 입력을 얼마나 바꾸면 스펙 안에 들어가는지(변경 한도·안전 여유·우선순위 설정 가능)를 보여줍니다.
+  이 데이터는 이미 만들어진 시료를 측정한 관측 데이터라서 원인-결과가 확정된 것이 아니므로, 추천 조건은 시험 시료로 확인해야 합니다.
+- **Tab 3 (시료 확인)**: 스펙을 모두 만족한 시료 전체 표(전장 오름차순)와 엑셀 머리글에서 인식한 열 정보를 함께 보여줍니다.
+- **Tab 4 (Go/No-Go 게이지 설계)**: ① 허용 불합격률(0~5%)별로 전장·일자-Y 범위를 비교하고, ② 게이지 제작 공차와 마모 여유를 안쪽으로 반영해 GO/NO-GO 설계 치수를 계산하고,
+  ③ 그 게이지로 이번 시료를 판정한 결과(통과·유출·양품 NG)를 보여줍니다. 측정 불확도와 온도 영향은 반영하지 않습니다.
+- **Tab 5 (품질 분석)**: 5개 아코디언(기본은 닫힘) — 전장 구간별 합격률, 공정능력(Cpk, 규격이 있는 타겟 3개만), 분포 분석, 상관·산점도, 런차트·관리도.
+  주의: 이 엑셀은 행이 단축 윤곽도 오름차순으로 정렬되어 있어서, 런차트·관리도의 '엑셀 행 순서' 경향은 생산 순서가 아니라 정렬 때문일 수 있습니다.
 - **제외되는 행**: 엑셀 하단의 `MIN / MAX / AVG`, `0.8 미만`, `0.8 이상`, `합격 / 불합격` 같은 요약·구분 행은 시료가 아니므로
   파일명 패턴(기본 `.xls` 또는 `QMS` 포함)으로 걸러냅니다.
 - **열 찾기**: 타겟은 1행(구분 행) 라벨 위치, 변수는 2행 머리글 텍스트로 찾습니다. 열 위치가 바뀌어도 동작하지만
