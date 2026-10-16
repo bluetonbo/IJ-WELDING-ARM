@@ -1417,6 +1417,7 @@ with tab_main:
             win = find_pass_window(df, _flags, _vk[0], _vk[1]) if len(_vk) >= 2 else None
             update_progress("허용 불합격률별 범위를 비교하는 중...")
             trade = window_tradeoff(df, _flags, _vk[0], _vk[1]) if win is not None else []
+            trade_end = window_tradeoff(df, _flags, "양 끝단 포함 전장", _vk[1]) if (win is not None and "양 끝단 포함 전장" in df.columns and df["양 끝단 포함 전장"].notna().all()) else []
 
             update_progress("결과 파일 만드는 중...")
             spec_txt = " / ".join(f"{k} {min(v):g}~{max(v):g}" for k, v in _specs.items())
@@ -1427,7 +1428,7 @@ with tab_main:
             st.session_state["mm_result"] = {
                 "summary": summary, "subset": subset, "status": status_df, "specs": _specs, "spec_txt": spec_txt,
                 "var_keys": list(_var_rules), "cols": cols, "info": info, "file": _file_name, "sheet": sheet_name,
-                "df": df, "nominals": {k: _last_number(cols[k]["header"]) for k in _var_rules}, "window": win, "tradeoff": trade, "end_summary": end_summary,
+                "df": df, "nominals": {k: _last_number(cols[k]["header"]) for k in _var_rules}, "window": win, "tradeoff": trade, "tradeoff_end": trade_end, "end_summary": end_summary,
                 "xlsx": build_result_xlsx(summary, status_df, subset, params, win, end_summary) if not subset.empty else None,
             }
 
@@ -1649,6 +1650,12 @@ with tab_cond:
     if r is not None:
         dfc, specs = r["df"], r["specs"]
         xk, yk = r["var_keys"][0], r["var_keys"][1]
+        xmode = "c"
+        if "양 끝단 포함 전장" in dfc.columns and dfc["양 끝단 포함 전장"].notna().all():
+            _xsel = st.radio("전장 기준", ["중심 기준 전장", "양 끝단 포함 전장 (지그 치수용)"], horizontal=True, key="cond_xbasis",
+                             help="양 끝단 포함 전장 = 오른쪽 끝단 최외측 Y − 왼쪽 끝단 최외측 Y (파이프 기울기로 튀어나온 길이 포함). 지그는 이 값을 기준으로 만들어야 제품이 들어갑니다.")
+            if _xsel.startswith("양 끝단"):
+                xk, xmode = "양 끝단 포함 전장", "e"
         tg = list(specs)
         xa, ya = dfc[xk].to_numpy(dtype=float), dfc[yk].to_numpy(dtype=float)
         tm = dfc[tg].to_numpy(dtype=float)
@@ -1718,8 +1725,8 @@ with tab_cond:
         wx = p3.number_input(f"근거 창 {xk} ± (mm)", min_value=0.01, max_value=0.5, value=0.05, step=0.01, format="%.2f", key="cond_wx")
         wy = p4.number_input(f"근거 창 {yk} ± (mm)", min_value=0.01, max_value=0.5, value=0.05, step=0.01, format="%.2f", key="cond_wy")
         b1, b2, b3, b4 = st.columns(4)
-        xlo_i = b1.number_input(f"{xk} 하한 (조정 가능 범위)", value=xmin_d, step=0.01, format="%.3f", key="cond_xlo")
-        xhi_i = b2.number_input(f"{xk} 상한", value=xmax_d, step=0.01, format="%.3f", key="cond_xhi")
+        xlo_i = b1.number_input(f"{xk} 하한 (조정 가능 범위)", value=xmin_d, step=0.01, format="%.3f", key=f"cond_xlo_{xmode}")
+        xhi_i = b2.number_input(f"{xk} 상한", value=xmax_d, step=0.01, format="%.3f", key=f"cond_xhi_{xmode}")
         ylo_i = b3.number_input(f"{yk} 하한 (조정 가능 범위)", value=ymin_d, step=0.01, format="%.3f", key="cond_ylo")
         yhi_i = b4.number_input(f"{yk} 상한", value=ymax_d, step=0.01, format="%.3f", key="cond_yhi")
         st.caption("조정 가능 범위의 기본값은 이번 데이터에서 실제 측정된 범위입니다. 현장에서 바꿀 수 있는 범위가 더 좁으면 줄여서 입력하세요.")
@@ -1840,6 +1847,13 @@ with tab_gauge:
     r = _analysis_result()
     if r is not None:
         trade = r.get("tradeoff")
+        trade_end = r.get("tradeoff_end")
+        gbasis = "c"
+        if trade and trade_end:
+            _gsel = st.radio("전장 기준", ["중심 기준 전장", "양 끝단 포함 전장 (지그 치수용)"], horizontal=True, key="gauge_basis",
+                             help="양 끝단 포함 전장 = 오른쪽 끝단 최외측 Y − 왼쪽 끝단 최외측 Y (파이프 기울기로 튀어나온 길이 포함). 지그는 이 값을 기준으로 만들어야 제품이 들어갑니다.")
+            if _gsel.startswith("양 끝단"):
+                trade, gbasis = trade_end, "e"
         if not trade:
             st.info("합격 시료가 없거나 이전 버전의 결과입니다. Tab 1 에서 'Min/Max 분석 실행'을 다시 눌러주세요.")
         else:
@@ -1880,7 +1894,7 @@ with tab_gauge:
 
             labels = [f"허용 {w['rate'] * 100:g}% — {xk} {w['x'][0]:.3f}~{w['x'][1]:.3f} · {yk} {w['y'][0]:.3f}~{w['y'][1]:.3f} "
                       f"(시료 {w['n_in']}개, 불합격 {w['n_fail_in']}개)" for w in trade]
-            pick = st.selectbox("게이지 설계에 사용할 범위", labels, index=0, key="gauge_pick")
+            pick = st.selectbox("게이지 설계에 사용할 범위", labels, index=0, key=f"gauge_pick_{gbasis}")
             win = trade[labels.index(pick)]
 
             st.markdown("<hr>", unsafe_allow_html=True)
@@ -2218,6 +2232,7 @@ if tab_help is not None:
   ① 예측 정확도(교차검증 오차 RMSE, 설명력 R², OK/NG 판정 정확도, 확률 보정), ② 3개 스펙을 만족할 확률이 목표(기본 90%) 이상이면서 실측 근거 시료가 충분한 입력 구간(추천 작업 구간)과
   OK 확률 지도, ③ 현재 NG 시료의 입력을 얼마나 바꾸면 스펙 안에 들어가는지(변경 한도·안전 여유·우선순위 설정 가능)를 보여줍니다.
   이 데이터는 이미 만들어진 시료를 측정한 관측 데이터라서 원인-결과가 확정된 것이 아니므로, 추천 조건은 시험 시료로 확인해야 합니다.
+- **전장 기준 선택 (Tab 2, Tab 4)**: 두 탭 맨 위의 '전장 기준'에서 '양 끝단 포함 전장'을 고르면 전장 대신 양 끝단(파이프 기울기)을 포함한 전장으로 조건 찾기와 게이지 설계를 합니다. 지그 치수는 이 기준으로 만들어야 합니다.
 - **Tab 3 (시료 확인)**: 스펙을 모두 만족한 시료 전체 표(전장 오름차순)와 엑셀 머리글에서 인식한 열 정보를 함께 보여줍니다.
 - **Tab 4 (Go/No-Go 게이지 설계)**: ① 허용 불합격률(0~5%)별로 전장·일자-Y 범위를 비교하고, ② 게이지 제작 공차와 마모 여유를 안쪽으로 반영해 GO/NO-GO 설계 치수를 계산하고,
   ③ 그 게이지로 이번 시료를 판정한 결과(통과·유출·양품 NG)를 보여줍니다. 측정 불확도와 온도 영향은 반영하지 않습니다.
