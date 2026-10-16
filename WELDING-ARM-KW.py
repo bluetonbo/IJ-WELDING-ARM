@@ -370,12 +370,12 @@ def analyze_spec(df: pd.DataFrame, specs: dict, var_keys):
 def build_result_xlsx(summary: pd.DataFrame, status_df: pd.DataFrame, subset: pd.DataFrame, params: dict, window=None) -> bytes:
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
+        summary.to_excel(w, sheet_name="합격시료 Min_Max", index=False)
+        status_df.to_excel(w, sheet_name="타겟 합격 현황", index=False)
         if window is not None:
             rng, ver = window_frames(window)
-            rng.to_excel(w, sheet_name="합격 보장 범위", index=False)
-            ver.to_excel(w, sheet_name="합격 보장 범위", index=False, startrow=len(rng) + 3)
-        summary.to_excel(w, sheet_name="참고_합격시료 Min_Max", index=False)
-        status_df.to_excel(w, sheet_name="타겟 합격 현황", index=False)
+            rng.to_excel(w, sheet_name="참고_합격 보장 범위", index=False)
+            ver.to_excel(w, sheet_name="참고_합격 보장 범위", index=False, startrow=len(rng) + 3)
         subset.to_excel(w, sheet_name="합격 시료 데이터", index=False)
         pd.DataFrame(list(params.items()), columns=["조건", "값"]).to_excel(w, sheet_name="분석 조건", index=False)
         for ws in w.book.worksheets:
@@ -1053,7 +1053,7 @@ with tab_main:
             df, cols, info = prepare_dataset(raw, _var_rules, _target_rules, _name_pat)
             update_progress("3개 타겟 스펙을 모두 만족하는 시료를 고르는 중...")
             summary, subset, status_df = analyze_spec(df, _specs, list(_var_rules))
-            update_progress("전장 · 일자-Y 합격 보장 범위를 찾는 중...")
+            update_progress("참고용 합격 보장 범위(불합격 0개)를 찾는 중...")
             _vk = list(_var_rules)
             _flags = pass_matrix(df, _specs)["전체"].values
             win = find_pass_window(df, _flags, _vk[0], _vk[1]) if len(_vk) >= 2 else None
@@ -1077,9 +1077,13 @@ with tab_main:
             hist = st.session_state.setdefault("process_history", [])
             rec = {"시각": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "구분": "타겟 스펙 합격",
                    "데이터 파일": _file_name, "조건": spec_txt, "시료 수": len(subset)}
+            if not summary.empty:
+                for key in _var_rules:
+                    r = summary[(summary["항목"] == key) & (summary["구분"] == "측정값")].iloc[0]
+                    rec[f"{key} 최종 Min ~ Max"] = f"{r['Min']:.4f} ~ {r['Max']:.4f}"
             if win is not None:
-                rec[f"{win['xkey']} 보장범위"] = f"{win['x'][0]:.4f} ~ {win['x'][1]:.4f}"
-                rec[f"{win['ykey']} 보장범위"] = f"{win['y'][0]:.4f} ~ {win['y'][1]:.4f}"
+                rec[f"{win['xkey']} 보장범위(참고)"] = f"{win['x'][0]:.4f} ~ {win['x'][1]:.4f}"
+                rec[f"{win['ykey']} 보장범위(참고)"] = f"{win['y'][0]:.4f} ~ {win['y'][1]:.4f}"
             hist.insert(0, rec)
             st.session_state.setdefault("spec_counter", Counter()).update([spec_txt])
             return {"n_in": len(subset), "spec_txt": spec_txt}
@@ -1098,7 +1102,7 @@ with tab_main:
         elif _res["n_in"] == 0:
             st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없습니다. 스펙 값을 확인해주세요.")
         else:
-            st.success(f"3개 타겟 스펙을 모두 만족하는 시료 {_res['n_in']}건으로 전장 · 일자-Y 합격 보장 범위를 계산했습니다. 아래 결과를 확인하세요.")
+            st.success(f"3개 타겟 스펙을 모두 만족하는 시료 {_res['n_in']}건으로 전장 · 일자-Y 최종 Min/Max를 계산했습니다. 아래 결과를 확인하세요.")
 
     st.markdown("<hr>", unsafe_allow_html=True)
     res = st.session_state.get("mm_result")
@@ -1113,7 +1117,7 @@ with tab_main:
         k1, k2, k3, k4 = st.columns(4)
         k1.markdown(_kpi("합격 조건", "3개 타겟 동시 만족", "단축·장축 위치도, 단축 윤곽도"), unsafe_allow_html=True)
         k2.markdown(_kpi("유효 시료 수", f"{n_all}개", "엑셀 시료 행 기준"), unsafe_allow_html=True)
-        k3.markdown(_kpi("스펙 합격 시료 수", f"{n_in}개", "3개 타겟 스펙 모두 만족", color=SUCCESS if n_in else WARNING), unsafe_allow_html=True)
+        k3.markdown(_kpi("스펙 합격(OK) 시료 수", f"{n_in}개", "3개 타겟 스펙 모두 만족", color=SUCCESS if n_in else WARNING), unsafe_allow_html=True)
         k4.markdown(_kpi("합격률", f"{pct:.1f}%", "합격 시료 ÷ 유효 시료"), unsafe_allow_html=True)
 
         notes = []
@@ -1125,30 +1129,34 @@ with tab_main:
             st.caption(" · ".join(notes))
 
         st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-        st.markdown('<div class="block-title">① 합격 보장 범위 — 전장 · 일자-Y 가 이 범위에 들어오면 3개 타겟 스펙을 모두 만족</div>', unsafe_allow_html=True)
-        if win is None:
-            st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없어 합격 보장 범위를 찾지 못했습니다.")
+        st.markdown('<div class="block-title">① 합격(OK) 시료의 최종 Min / Max — 전장 · 일자-Y</div>', unsafe_allow_html=True)
+        if summary.empty:
+            st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없어 Min/Max를 계산하지 못했습니다.")
         else:
-            xk, yk = win["xkey"], win["ykey"]
-            wc = st.columns(4)
-            for holder, label, val in ((wc[0], f"{xk} Min", win["x"][0]), (wc[1], f"{xk} Max", win["x"][1]),
-                                       (wc[2], f"{yk} Min", win["y"][0]), (wc[3], f"{yk} Max", win["y"][1])):
-                holder.markdown(_kpi(label, f"{val:.4f}"), unsafe_allow_html=True)
+            vals = summary[summary["구분"] == "측정값"].set_index("항목")
+            card_cols = st.columns(2 * len(res["var_keys"]))
+            idx = 0
+            for key in res["var_keys"]:
+                for kind in ("Min", "Max"):
+                    r = vals.loc[key]
+                    card_cols[idx].markdown(
+                        _kpi(f"{key} {kind}", f"{r[kind]:.4f}", f"{r[f'{kind} 시료']} (엑셀 {r[f'{kind} 엑셀 행']}행)"),
+                        unsafe_allow_html=True,
+                    )
+                    idx += 1
             st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
-            if win["n_fail_in"] == 0:
-                st.success(
-                    f"{xk} {win['x'][0]:.4f} ~ {win['x'][1]:.4f} 이면서 {yk} {win['y'][0]:.4f} ~ {win['y'][1]:.4f} 인 시료는 "
-                    f"{win['n_in']}개이고, 전부 3개 타겟 스펙을 만족합니다 (불합격 0개). "
-                    f"합격 시료 {win['n_pass']}개 중 {win['n_pass_in']}개({win['n_pass_in'] / win['n_pass'] * 100:.1f}%)를 포함합니다.")
-            else:
-                st.warning(f"범위 안에 불합격 시료가 {win['n_fail_in']}개 섞여 있습니다. 데이터를 확인해주세요.")
+            _xk, _yk = res["var_keys"][0], res["var_keys"][1]
+            st.success(
+                f"3개 스펙을 모두 만족한 시료 {n_in}개를 하나씩 모아, 그 중 가장 작은 값과 가장 큰 값을 최종 Min/Max로 정했습니다. "
+                f"따라서 합격 시료 {n_in}개는 전부 이 범위 안에 들어옵니다 "
+                f"({_xk} {vals.loc[_xk, 'Min']:.4f} ~ {vals.loc[_xk, 'Max']:.4f}, {_yk} {vals.loc[_yk, 'Min']:.4f} ~ {vals.loc[_yk, 'Max']:.4f}).")
+            _flags = pass_matrix(res["df"], res["specs"])["전체"].values
+            _inbox = res["df"][_xk].between(vals.loc[_xk, "Min"], vals.loc[_xk, "Max"]) & res["df"][_yk].between(vals.loc[_yk, "Min"], vals.loc[_yk, "Max"])
             st.caption(
-                f"{xk} 범위와 {yk} 범위를 **동시에** 만족해야 합니다 (둘 중 하나만 범위 안이면 합격이 보장되지 않습니다). "
-                "불합격 시료가 하나도 포함되지 않는 직사각형 범위 중 합격 시료를 가장 많이 포함하는 범위를 찾은 결과이며, "
-                "이번 데이터에서 실제로 측정된 시료 기준입니다. 시료가 추가되면 범위가 달라질 수 있습니다.")
-            st.altair_chart(window_scatter_chart(res["df"], pass_matrix(res["df"], res["specs"])["전체"].values, win),
-                            use_container_width=True, theme=None)
-            st.caption("흰색 사각형이 합격 보장 범위입니다. 초록 점은 합격, 빨간 점은 불합격 시료이며, 사각형 안에는 빨간 점이 없습니다.")
+                f"참고: 반대로, 이 두 범위에 동시에 들어오는 시료는 {int(_inbox.sum())}개이고 그 중 {int((~_flags[_inbox.values]).sum())}개는 스펙을 만족하지 못한 시료입니다. "
+                "즉 이 범위는 '합격 시료가 존재했던 폭'이며, 범위 안이라고 해서 합격이 보장되지는 않습니다 (보장되는 범위는 아래 ③ 참고).")
+            num_cfg = {c: st.column_config.NumberColumn(format="%.4f") for c in ("Min", "Max", "Max-Min")}
+            st.dataframe(summary, use_container_width=True, hide_index=True, column_config=num_cfg)
 
         st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
         st.markdown('<div class="block-title">② 타겟 항목별 합격 현황</div>', unsafe_allow_html=True)
@@ -1157,24 +1165,30 @@ with tab_main:
         stat_cfg["단독 합격률(%)"] = st.column_config.NumberColumn(format="%.1f")
         st.dataframe(status_df, use_container_width=True, hide_index=True, column_config=stat_cfg)
 
-        if not summary.empty:
-            with st.expander("참고 · 합격 시료 전체의 Min/Max (이 범위 안에는 불합격 시료도 섞여 있음)", expanded=False):
-                st.caption("합격 시료들이 실제로 가졌던 전장·일자-Y 의 최소·최대값입니다. 이 범위 안에 들어와도 합격이 보장되지는 않습니다 "
-                           "(합격 보장 범위는 위 ① 을 사용하세요).")
-                vals = summary[summary["구분"] == "측정값"].set_index("항목")
-                card_cols = st.columns(2 * len(res["var_keys"]))
-                idx = 0
-                for key in res["var_keys"]:
-                    for kind in ("Min", "Max"):
-                        r = vals.loc[key]
-                        card_cols[idx].markdown(
-                            _kpi(f"{key} {kind}", f"{r[kind]:.4f}", f"{r[f'{kind} 시료']} (엑셀 {r[f'{kind} 엑셀 행']}행)"),
-                            unsafe_allow_html=True,
-                        )
-                        idx += 1
+        with st.expander("③ 참고 · 이 범위 안이면 반드시 합격인 더 좁은 범위 (불합격 0개, Go/No-Go 게이지용)", expanded=False):
+            if win is None:
+                st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없어 범위를 찾지 못했습니다.")
+            else:
+                xk, yk = win["xkey"], win["ykey"]
+                st.caption(
+                    f"위 ① 의 Min/Max 는 합격 시료의 양 끝값이라 그 안에 불합격 시료가 섞여 있습니다. 여기서는 {xk} 범위와 {yk} 범위에 **동시에** 들어오면 "
+                    "불합격 시료가 하나도 없도록, 불합격이 포함되지 않는 직사각형 범위 중 합격 시료를 가장 많이 포함하는 범위를 찾았습니다. "
+                    "이번 데이터에서 실제 측정된 시료 기준이며, 시료가 추가되면 달라질 수 있습니다.")
+                wc = st.columns(4)
+                for holder, label, val in ((wc[0], f"{xk} Min", win["x"][0]), (wc[1], f"{xk} Max", win["x"][1]),
+                                           (wc[2], f"{yk} Min", win["y"][0]), (wc[3], f"{yk} Max", win["y"][1])):
+                    holder.markdown(_kpi(label, f"{val:.4f}"), unsafe_allow_html=True)
                 st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
-                num_cfg = {c: st.column_config.NumberColumn(format="%.4f") for c in ("Min", "Max", "Max-Min")}
-                st.dataframe(summary, use_container_width=True, hide_index=True, column_config=num_cfg)
+                if win["n_fail_in"] == 0:
+                    st.success(
+                        f"{xk} {win['x'][0]:.4f} ~ {win['x'][1]:.4f} 이면서 {yk} {win['y'][0]:.4f} ~ {win['y'][1]:.4f} 인 시료는 "
+                        f"{win['n_in']}개이고, 전부 3개 타겟 스펙을 만족합니다 (불합격 0개). "
+                        f"합격 시료 {win['n_pass']}개 중 {win['n_pass_in']}개({win['n_pass_in'] / win['n_pass'] * 100:.1f}%)를 포함합니다.")
+                else:
+                    st.warning(f"범위 안에 불합격 시료가 {win['n_fail_in']}개 섞여 있습니다. 데이터를 확인해주세요.")
+                st.altair_chart(window_scatter_chart(res["df"], pass_matrix(res["df"], res["specs"])["전체"].values, win),
+                                use_container_width=True, theme=None)
+                st.caption("흰색 사각형이 이 범위입니다. 초록 점은 합격, 빨간 점은 불합격 시료이며, 사각형 안에는 빨간 점이 없습니다.")
 
         if res.get("xlsx"):
             st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
@@ -1251,7 +1265,7 @@ with tab_gauge:
             st.markdown('<div class="block-title">① 허용 불합격률별 범위 비교</div>', unsafe_allow_html=True)
             st.caption(f"{xk} 범위와 {yk} 범위를 동시에 만족하는 시료 중 불합격이 차지하는 비율을 일정 수준까지 허용했을 때, "
                        "범위가 얼마나 넓어지고 게이지 통과율이 얼마나 올라가는지 비교합니다. "
-                       "허용률 0% 는 불합격이 하나도 없는 범위(Tab 1 ①)입니다.")
+                       "허용률 0% 는 불합격이 하나도 없는 범위(Tab 1 ③ 참고)입니다.")
             rows = []
             for w in trade:
                 rows.append({
@@ -1604,24 +1618,11 @@ if tab_help is not None:
     st.markdown("""
 - **계산 기준**: 타겟 항목 3개(단축 위치도 0~1.0, 장축 위치도 0~1.0, 단축 윤곽도 0~0.8, 경계 포함)를 **모두 동시에** 만족하면 합격입니다.
   타겟 스펙 값은 Tab 1 상단에서 바꿀 수 있습니다.
-- **합격 보장 범위 (Tab 1 ①)**: 전장 범위와 일자-Y 범위를 **동시에** 만족하면 3개 타겟 스펙을 모두 만족하도록, 불합격 시료가 하나도 포함되지 않는
-  직사각형 범위 중 합격 시료를 가장 많이 포함하는 범위를 정확히 찾습니다. 이번 데이터에서 실제 측정된 시료 기준이라 시료가 늘면 범위가 바뀔 수 있고,
+- **최종 Min/Max (Tab 1 ①)**: 시료를 하나씩 보고 3개 타겟 스펙을 모두 만족하면 OK 로 분류한 뒤, OK 시료 전체에서 전장·일자-Y 의 가장 작은 값과
+  가장 큰 값을 구합니다. OK 시료는 전부 이 범위 안에 들어옵니다. 반대로 이 범위 안에 들어온 시료가 전부 OK 인 것은 아닙니다.
+- **합격 보장 범위 (Tab 1 ③ 참고, Tab 3 게이지 설계)**: 전장 범위와 일자-Y 범위를 **동시에** 만족하면 3개 타겟 스펙을 모두 만족하도록, 불합격 시료가 하나도 포함되지
+  않는 직사각형 범위 중 합격 시료를 가장 많이 포함하는 범위를 정확히 찾습니다. 이번 데이터에서 실제 측정된 시료 기준이라 시료가 늘면 범위가 바뀔 수 있고,
   측정하지 않은 다른 요인의 영향은 반영되지 않습니다.
-- **참고용 Min/Max**: 합격 시료 전체의 전장·일자-Y 최소·최대값(Tab 1 하단 접이식)입니다. 이 범위 안에는 불합격 시료도 섞여 있어 합격을 보장하지 않습니다.
-- **타겟은 '값' 열 기준**: 위치도/윤곽도 열의 값(예: 0.1128)이 스펙 범위 안인지 봅니다. 바로 옆 열의 편차값
-  (예: -0.8872)은 쓰지 않습니다.
-- **일자-Y**는 2행 머리글 `3-1 일자 Y 219.66` 열입니다 (`3-2 휨 Y`는 다른 항목이라 포함하지 않습니다).
-- **Tab 2 (시료 확인)**: 스펙을 모두 만족한 시료 전체 표(전장 오름차순)와, 엑셀 머리글에서 인식한 열 정보를 함께 보여줍니다.
-- **Tab 3 (Go/No-Go 게이지 설계)**: ① 허용 불합격률(0~5%)별로 전장·일자-Y 범위를 비교하고(허용률을 올리면 범위가 넓어지는 대신 통과품에 불합격이 섞임),
-  선택한 범위에 ② 게이지 제작 공차(범위 폭 대비 %, 또는 mm 직접 입력)와 마모 여유를 안쪽으로 반영해 GO/NO-GO 설계 치수를 계산하고,
-  ③ 그 게이지로 이번 시료를 판정한 결과(통과·유출·양품 NG)를 보여줍니다. 측정 불확도와 온도 영향은 반영하지 않습니다.
-- **Tab 4 (품질 분석)**: Tab 1 에서 분석을 실행하면 같은 데이터로 아래 5개 분석을 볼 수 있습니다. 각 항목은 아코디언이며 기본은 닫혀 있습니다.
-  - 전장 구간별 합격률: 전장을 구간으로 나눠 합격률을 보고, 목표 합격률을 만족하는 '권장 전장 하한'을 찾습니다.
-  - 공정능력 (Cpk): 규격이 있는 타겟 3개(위치도 2종, 윤곽도)의 Cpk(=Cpu), 백분위 방식 Cpk, 예상 불량 PPM. 전장·일자-Y 는 기하공차 관련
-    관리 변수라 규격이 없어 제외합니다. 규격 밖이 잘려 나간 합격 시료만으로는 능력이 과대평가되니 전체 기준을 우선 보세요.
-  - 분포 분석: 기술 통계, 왜도/첨도, 정규성(JB), 히스토그램+정규곡선, 전체 vs 합격 박스플롯.
-  - 상관 · 산점도: 항목 간 상관 행렬과 산점도·회귀선 (합격/불합격 색 구분).
-  - 런차트 · 관리도: 엑셀 행 순서를 시간 순서로 보고 I-MR 관리도, 이동평균, 이상점 규칙 검출을 합니다.
 - **제외되는 행**: 엑셀 하단의 `MIN / MAX / AVG`, `0.8 미만`, `0.8 이상`, `합격 / 불합격` 같은 요약·구분 행은 시료가 아니므로
   파일명 패턴(기본 `.xls` 또는 `QMS` 포함)으로 걸러냅니다.
 - **열 찾기**: 타겟은 1행(구분 행) 라벨 위치, 변수는 2행 머리글 텍스트로 찾습니다. 열 위치가 바뀌어도 동작하지만
