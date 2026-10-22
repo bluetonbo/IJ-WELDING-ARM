@@ -389,6 +389,7 @@ def prepare_dataset(raw: pd.DataFrame, var_rules: dict, target_rules: dict, name
 
     for key in (abs_targets or ()):  # 엑셀 값이 음수로 기록된 타겟은 크기(절댓값)로 판정한다
         if key in out.columns:
+            out[f"{key} (원본)"] = out[key]  # 엑셀에 적힌 원래 값(부호 포함)
             out[key] = out[key].abs()
             cols[key]["abs"] = True
 
@@ -430,6 +431,10 @@ def analyze_spec(df: pd.DataFrame, specs: dict, var_keys):
         mask &= ok
     subset = df[mask].sort_values(list(var_keys)[0]).reset_index(drop=True)
     status_df = pd.DataFrame(status)
+    if len(subset):  # 스펙을 모두 만족한(OK) 시료만의 결과값 Min / Max / 평균
+        status_df["OK 시료 Min"] = [subset[k].min() for k in status_df["타겟 항목"]]
+        status_df["OK 시료 Max"] = [subset[k].max() for k in status_df["타겟 항목"]]
+        status_df["OK 시료 평균"] = [subset[k].mean() for k in status_df["타겟 항목"]]
 
     rows = []
     if not subset.empty:
@@ -1568,9 +1573,20 @@ with tab_main:
                        "지그에 걸림(스토퍼)이 있을 때 참고하세요. 지그 구조에 따라 필요한 치수가 달라질 수 있습니다.")
 
         st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-        st.markdown('<div class="block-title">③ 타겟 항목별 합격 현황</div>', unsafe_allow_html=True)
-        st.caption("'단독 합격'은 그 항목 하나만 봤을 때의 합격 수입니다.")
-        stat_cfg = {c: st.column_config.NumberColumn(format="%.4f") for c in ("전체 실측 Min", "전체 실측 Max")}
+        st.markdown('<div class="block-title">③ 타겟 항목별 결과값 · 합격 현황</div>', unsafe_allow_html=True)
+        if n_in:
+            _tc = st.columns(len(res["specs"]))
+            for _holder, (_k, _sp) in zip(_tc, res["specs"].items()):
+                _row = status_df[status_df["타겟 항목"] == _k].iloc[0]
+                _holder.markdown(_kpi(f"{_k} (OK 시료)", f"{_row['OK 시료 Min']:.4f} ~ {_row['OK 시료 Max']:.4f}",
+                                      f"평균 {_row['OK 시료 평균']:.4f} · 스펙 {min(_sp):g} ~ {max(_sp):g}"), unsafe_allow_html=True)
+            for _k, _v in res["cols"].items():
+                _oc = f"{_k} (원본)"
+                if _v.get("abs") and _oc in subset.columns:
+                    st.caption(f"{_k}: 엑셀 원본 값은 음수로 기록돼 있어 크기(절댓값)로 판정했습니다. 엑셀 원본 값으로는 "
+                               f"{subset[_oc].min():.4f} ~ {subset[_oc].max():.4f} (평균 {subset[_oc].mean():.4f}) 입니다.")
+        st.caption("OK 시료 Min / Max / 평균은 모든 타겟 스펙을 만족한 시료만의 값이고, '단독 합격'은 그 항목 하나만 봤을 때의 합격 수입니다.")
+        stat_cfg = {c: st.column_config.NumberColumn(format="%.4f") for c in ("전체 실측 Min", "전체 실측 Max", "OK 시료 Min", "OK 시료 Max", "OK 시료 평균")}
         stat_cfg["단독 합격률(%)"] = st.column_config.NumberColumn(format="%.1f")
         st.dataframe(status_df, use_container_width=True, hide_index=True, column_config=stat_cfg)
 
