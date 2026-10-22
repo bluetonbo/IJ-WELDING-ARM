@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-WELDING-ARM-KW : 용접 암 측정 데이터(DATA-KW.xlsx) -> 타겟 스펙을 만족하는 시료의 전장 / 일자-Y Min·Max 추출기
+WELDING-ARM-KW : 용접 암 측정 데이터(DATA-KW.xlsx) -> 타겟 스펙을 만족하는 시료의 X / Y Min·Max 추출기
 ------------------------------------------------------------
-- 타겟 항목(단축 위치도 0~1.0, 장축 위치도 0~1.0, 단축 윤곽도 0~0.8)을 '모두 동시에' 만족하는
-  시료만 골라서, 변수 항목(전장, 일자-Y)의 Min / Max (측정값과 편차 둘 다)와 해당 시료
+- 타겟 항목(단축 위치도 0~1.0, 장축 위치도 0~1.0, 단축 윤곽도 0~0.8, 케이스 각도 8.17~9.37)을 '모두 동시에' 만족하는
+  시료만 골라서, 변수 항목(X, Y)의 Min / Max (측정값과 편차 둘 다)와 해당 시료
   (파일명, 엑셀 행)를 찾는다. 스펙 경계값은 포함한다.
 - 타겟 항목 열은 1행(구분 행)의 '단축 위치도 / 장축 위치도 / 단축 윤곽도' 라벨 위치로,
-  변수 항목 열은 2행 머리글('전장', '3-1 일자 Y')로 찾는다
+  변수 항목 열은 2행 머리글('X', '3-1 일자 Y')로 찾는다
 - 엑셀 하단의 MIN / MAX / AVG 요약 행, '0.8 미만' 같은 구분 행은 시료가 아니므로
   파일명 패턴(기본: '.xls' 또는 'QMS' 포함)으로 걸러내서 계산에서 제외한다
 - UI/로그인/임시비밀번호 인프라/사이드바 업로드/상단 탭 구조는 WELDING-ARM-KW 원본과
@@ -185,7 +185,7 @@ def login_gate():
                 </div>
                 <div style='color:{ACCENT_BLUE}; font-size:2.16rem; font-weight:700; letter-spacing:0.04em; text-align:center; margin-bottom:10px; line-height:1.25;'>WELDING ARM 측정 데이터 분석</div>
                 <div style='text-align:center; margin:0 0 4px 0;'>
-                    <span style='display:inline-block; color:{TEXT_MAIN}; font-size:1.35rem; font-weight:600; line-height:1.4; border-bottom:2px solid {ACCENT_BLUE}; padding-bottom:10px;'>타겟 스펙 만족 시료의 전장 · 일자-Y Min / Max 추출</span>
+                    <span style='display:inline-block; color:{TEXT_MAIN}; font-size:1.35rem; font-weight:600; line-height:1.4; border-bottom:2px solid {ACCENT_BLUE}; padding-bottom:10px;'>타겟 스펙 만족 시료의 X · Y Min / Max 추출</span>
                 </div>
                 <div style='color:{TEXT_MUTED}; font-size:0.82rem; text-align:center; margin-top:12px;'>V1.0</div>
             </div>""",
@@ -219,18 +219,22 @@ DEFAULT_TARGET_RULES = {
     "단축 위치도": r"단축\s*위치도",
     "장축 위치도": r"장축\s*위치도",
     "단축 윤곽도": r"단축\s*윤곽도",
+    "케이스 각도": r"케이스\s*각도",
 }
 # 타겟 스펙 (하한, 상한) - 경계 포함. 사이드바에서 바꿀 수 있다.
 DEFAULT_TARGET_SPECS = {
     "단축 위치도": (0.0, 1.0),
     "장축 위치도": (0.0, 1.0),
     "단축 윤곽도": (0.0, 0.8),
+    "케이스 각도": (8.17, 9.37),
 }
+# 엑셀 값이 음수(예: -9.38)로 기록돼 있어 '크기(절댓값)'로 스펙과 비교하는 타겟. 사이드바 체크박스로 끌 수 있다.
+DEFAULT_TARGET_ABS = {"케이스 각도": True}
 # 변수 항목: 2행 머리글 텍스트로 '측정값 열'을 찾고, 바로 오른쪽 열(머리글 비어 있음)을 '편차' 열로 본다.
-# '일자-Y'는 '3-1 일자 Y 219.66' 열이다 ('3-2 휨 Y'와는 다른 항목).
+# 'Y' 는 머리글이 정확히 'Y' 인 열이다 ('3-2 휨 Y 219.66' 처럼 다른 글자가 붙은 열은 다른 항목).
 DEFAULT_VARIABLE_RULES = {
-    "전장": r"^\s*전장",
-    "일자-Y": r"일자\s*Y",
+    "X": r"^\s*X\s*$|^\s*\uc804\uc7a5",          # 머리글 'X' (옛 파일의 한글 머리글도 인식)
+    "Y": r"^\s*Y\s*$|\uc77c\uc790\s*-?\s*Y",     # 머리글 'Y' (옛 파일은 '일자 Y')
 }
 # 시료 행으로 인정할 파일명 패턴 (MIN/MAX/AVG, '0.8 미만' 등 요약·구분 행 제외용)
 DEFAULT_NAME_PATTERN = r"\.xls|QMS"
@@ -304,18 +308,18 @@ def locate_columns(raw: pd.DataFrame, var_rules: dict, target_rules: dict):
     return header_row, cols
 
 
-# ---------- 양 끝단(파이프 기울기)을 포함한 전장 ----------
-# 전장(= 휨 X − 일자 X)은 양쪽 끝단 '중심' 사이의 거리이다. 실제 끝단 파이프는 기울어져 있어서 원주 8점의 Y 값이 서로 다르므로,
-# 지그를 만들 때는 중심 기준 전장에 기울어서 튀어나온 만큼을 더해야 제품이 들어간다.
-#   왼쪽 끝단: Y-값_단1~8 (원주 8점의 Y 좌표, 약 -119)  -> 가장 왼쪽(최외측) = 가장 작은 Y, 안쪽(최내측) = 가장 큰 Y
-#   오른쪽 끝단: Y-값_장1~8 (원주 8점의 Y 좌표, 약 156)  -> 가장 오른쪽(최외측) = 가장 큰 Y, 안쪽(최내측) = 가장 작은 Y
-#   양 끝단 포함 전장 = 오른쪽 최외측 Y − 왼쪽 최외측 Y   (지그 전장 치수의 기준)
-#   양 끝단 안쪽 전장 = 오른쪽 최내측 Y − 왼쪽 최내측 Y   (참고: 양 끝단이 가장 가까워지는 길이)
+# ---------- 양 끝단(파이프 기울기)을 포함한 X ----------
+# X(= 장축 거리 − 단축 거리)은 양쪽 끝단 '중심' 사이의 거리이다. 실제 끝단 파이프는 기울어져 있어서 원주 8점의 Y 값이 서로 다르므로,
+# 지그를 만들 때는 중심 기준 X에 기울어서 튀어나온 만큼을 더해야 제품이 들어간다.
+#   왼쪽(단축) 끝단: 단축 파이프 기울기 1~8 (옛 파일: Y-값_단1~8, 원주 8점의 Y 좌표, 약 -119)  -> 가장 왼쪽(최외측) = 가장 작은 Y, 안쪽(최내측) = 가장 큰 Y
+#   오른쪽(장축) 끝단: 장축 파이프 기울기 1~8 (옛 파일: Y-값_장1~8, 원주 8점의 Y 좌표, 약 156)  -> 가장 오른쪽(최외측) = 가장 큰 Y, 안쪽(최내측) = 가장 작은 Y
+#   양 끝단 포함 X = 오른쪽 최외측 Y − 왼쪽 최외측 Y   (지그 X 치수의 기준)
+#   양 끝단 안쪽 X = 오른쪽 최내측 Y − 왼쪽 최내측 Y   (참고: 양 끝단이 가장 가까워지는 길이)
 DEFAULT_END_RULES = {
-    "왼쪽 끝단": r"Y\s*-?\s*값\s*_?\s*단\s*(\d)",
-    "오른쪽 끝단": r"Y\s*-?\s*값\s*_?\s*장\s*(\d)",
+    "왼쪽 끝단": r"단축\s*파이프\s*기울기\s*(\d)|Y\s*-?\s*값\s*_?\s*단\s*(\d)",   # 옛 파일: Y-값_단1~8
+    "오른쪽 끝단": r"장축\s*파이프\s*기울기\s*(\d)|Y\s*-?\s*값\s*_?\s*장\s*(\d)",  # 옛 파일: Y-값_장1~8
 }
-END_ITEMS = ["전장", "양 끝단 포함 전장", "양 끝단 안쪽 전장", "기울기 증가량", "왼쪽 끝단 최외측 Y", "오른쪽 끝단 최외측 Y"]
+END_ITEMS = ["X", "양 끝단 포함 X", "양 끝단 안쪽 X", "기울기 증가량", "왼쪽 끝단 최외측 Y", "오른쪽 끝단 최외측 Y"]
 
 
 def locate_end_columns(raw: pd.DataFrame, header_row: int, end_rules: dict) -> dict:
@@ -330,13 +334,14 @@ def locate_end_columns(raw: pd.DataFrame, header_row: int, end_rules: dict) -> d
             if isinstance(v, str):
                 m = rx.search(v.replace("\n", " "))
                 if m:
-                    found.append((int(m.group(1)) if m.groups() and m.group(1) and m.group(1).isdigit() else 99, c))
+                    nums = [g for g in m.groups() if g and g.isdigit()]  # 대체 패턴이 여러 개여도 번호가 잡힌 그룹을 사용
+                    found.append((int(nums[0]) if nums else 99, c))
         out[side] = [c for _, c in sorted(found)]
     return out
 
 
 def _add_end_extents(out: pd.DataFrame, body: pd.DataFrame, endcols: dict):
-    """시료 표(out)에 끝단 최외측/최내측 Y, 포함 전장, 안쪽 전장, 기울기 증가량 열을 붙이고, 점이 빠진 행(bool 배열)을 돌려준다."""
+    """시료 표(out)에 끝단 최외측/최내측 Y, 포함 X, 안쪽 X, 기울기 증가량 열을 붙이고, 점이 빠진 행(bool 배열)을 돌려준다."""
     import warnings
     left = np.column_stack([pd.to_numeric(body.iloc[:, c], errors="coerce").to_numpy(dtype=float) for c in endcols["왼쪽 끝단"]])
     right = np.column_stack([pd.to_numeric(body.iloc[:, c], errors="coerce").to_numpy(dtype=float) for c in endcols["오른쪽 끝단"]])
@@ -346,9 +351,9 @@ def _add_end_extents(out: pd.DataFrame, body: pd.DataFrame, endcols: dict):
         out["왼쪽 끝단 최내측 Y"] = np.nanmax(left, axis=1)
         out["오른쪽 끝단 최내측 Y"] = np.nanmin(right, axis=1)
         out["오른쪽 끝단 최외측 Y"] = np.nanmax(right, axis=1)
-    out["양 끝단 포함 전장"] = out["오른쪽 끝단 최외측 Y"] - out["왼쪽 끝단 최외측 Y"]
-    out["양 끝단 안쪽 전장"] = out["오른쪽 끝단 최내측 Y"] - out["왼쪽 끝단 최내측 Y"]
-    out["기울기 증가량"] = out["양 끝단 포함 전장"] - out["전장"]
+    out["양 끝단 포함 X"] = out["오른쪽 끝단 최외측 Y"] - out["왼쪽 끝단 최외측 Y"]
+    out["양 끝단 안쪽 X"] = out["오른쪽 끝단 최내측 Y"] - out["왼쪽 끝단 최내측 Y"]
+    out["기울기 증가량"] = out["양 끝단 포함 X"] - out["X"]
     return ~np.isfinite(left).all(axis=1) | ~np.isfinite(right).all(axis=1)
 
 
@@ -366,8 +371,8 @@ def end_extent_summary(sub: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def prepare_dataset(raw: pd.DataFrame, var_rules: dict, target_rules: dict, name_pattern: str, end_rules: dict = None):
-    """시료 행만 골라 '엑셀 행 / 파일명 / 시료 / 전장 / 일자-Y (+편차) / 타겟 3종' 표로 만든다."""
+def prepare_dataset(raw: pd.DataFrame, var_rules: dict, target_rules: dict, name_pattern: str, end_rules: dict = None, abs_targets=None):
+    """시료 행만 골라 '엑셀 행 / 파일명 / 시료 / X / Y (+편차) / 타겟 3종' 표로 만든다."""
     header_row, cols = locate_columns(raw, var_rules, target_rules)
     body = raw.iloc[header_row + 1:]
 
@@ -381,6 +386,11 @@ def prepare_dataset(raw: pd.DataFrame, var_rules: dict, target_rules: dict, name
         out[key] = pd.to_numeric(body.iloc[:, info["value_col"]], errors="coerce").values
         if info["dev_col"] is not None:
             out[f"{key} 편차"] = pd.to_numeric(body.iloc[:, info["dev_col"]], errors="coerce").values
+
+    for key in (abs_targets or ()):  # 엑셀 값이 음수로 기록된 타겟은 크기(절댓값)로 판정한다
+        if key in out.columns:
+            out[key] = out[key].abs()
+            cols[key]["abs"] = True
 
     endcols = locate_end_columns(raw, header_row, DEFAULT_END_RULES if end_rules is None else end_rules)
     has_end = bool(endcols) and all(len(v) > 0 for v in endcols.values())
@@ -442,7 +452,7 @@ def build_result_xlsx(summary: pd.DataFrame, status_df: pd.DataFrame, subset: pd
     with pd.ExcelWriter(bio, engine="openpyxl") as w:
         summary.to_excel(w, sheet_name="합격시료 Min_Max", index=False)
         if end_summary is not None and len(end_summary):
-            end_summary.to_excel(w, sheet_name="양끝단 포함 전장 Min_Max", index=False)
+            end_summary.to_excel(w, sheet_name="양끝단 포함 X Min_Max", index=False)
         status_df.to_excel(w, sheet_name="타겟 합격 현황", index=False)
         if window is not None:
             rng, ver = window_frames(window)
@@ -457,7 +467,7 @@ def build_result_xlsx(summary: pd.DataFrame, status_df: pd.DataFrame, subset: pd
     return bio.getvalue()
 
 
-# ---------- 합격 보장 범위 (전장 × 일자-Y) ----------
+# ---------- 합격 보장 범위 (X × Y) ----------
 def find_pass_window(df: pd.DataFrame, ok_flags, xkey: str, ykey: str):
     """두 변수(xkey, ykey)의 직사각형 범위 중, '불합격 시료가 하나도 들어오지 않으면서
     합격 시료를 가장 많이 포함하는' 범위를 정확하게 찾는다.
@@ -646,13 +656,13 @@ def window_scatter_chart(df: pd.DataFrame, ok_flags, win: dict, inner: dict = No
 
 
 # ============================================================
-# 1-2. 제조업 품질 분석 함수 (Tab 5 품질 분석): 전장 구간별 합격률 / 공정능력 / 분포 / 상관 / 관리도
+# 1-2. 제조업 품질 분석 함수 (Tab 5 품질 분석): X 구간별 합격률 / 공정능력 / 분포 / 상관 / 관리도
 #   - 차트는 Streamlit 에 기본 포함된 Altair 로 그린다 (별도 패키지 설치 불필요).
 #   - 차트 안의 필드 이름은 일부러 영문(ASCII)으로 쓴다 (Vega 표현식에서 한글 식별자 오류 방지).
 # ============================================================
 
 def _last_number(text):
-    """머리글 텍스트의 마지막 숫자 (예: '전장 275.16' -> 275.16, '3-1 일자 Y 219.66' -> 219.66)."""
+    """머리글 텍스트의 마지막 숫자 (예: 'X 275.16' -> 275.16, '3-1 일자 Y 219.66' -> 219.66)."""
     nums = _re.findall(r"-?\d+(?:\.\d+)?", str(text))
     return float(nums[-1]) if nums else None
 
@@ -667,10 +677,10 @@ def pass_matrix(df: pd.DataFrame, specs: dict) -> pd.DataFrame:
     return out
 
 
-# ---------- (4) 전장 구간별 합격률 ----------
+# ---------- (4) X 구간별 합격률 ----------
 def length_bin_table(df: pd.DataFrame, specs: dict, width: float) -> pd.DataFrame:
     flags = pass_matrix(df, specs)
-    start = (np.floor(df["전장"].values / width + 1e-9) * width).round(6)
+    start = (np.floor(df["X"].values / width + 1e-9) * width).round(6)
     t = pd.DataFrame({"start": start, "ok": flags["전체"].values})
     for k in specs:
         t[k] = flags[k].values
@@ -684,27 +694,27 @@ def length_bin_table(df: pd.DataFrame, specs: dict, width: float) -> pd.DataFram
         out[f"{k} 단독 합격률(%)"] = g[k].mean() * 100
     out = out.reset_index().rename(columns={"start": "구간 시작"})
     out["구간 끝"] = (out["구간 시작"] + width).round(6)
-    out["전장 구간"] = [f"{a:.2f} ~ {b:.2f}" for a, b in zip(out["구간 시작"], out["구간 끝"])]
-    cols = ["전장 구간", "시료 수", "합격 수", "합격률(%)"] + [f"{k} 단독 합격률(%)" for k in specs] + ["구간 시작", "구간 끝"]
+    out["X 구간"] = [f"{a:.2f} ~ {b:.2f}" for a, b in zip(out["구간 시작"], out["구간 끝"])]
+    cols = ["X 구간", "시료 수", "합격 수", "합격률(%)"] + [f"{k} 단독 합격률(%)" for k in specs] + ["구간 시작", "구간 끝"]
     return out[cols]
 
 
 def length_threshold_curve(df: pd.DataFrame, specs: dict, step: float = 0.02) -> pd.DataFrame:
-    """'전장 >= t' 인 시료만 남겼을 때의 시료 수와 합격률을 t 를 올려가며 계산한다."""
+    """'X >= t' 인 시료만 남겼을 때의 시료 수와 합격률을 t 를 올려가며 계산한다."""
     flags = pass_matrix(df, specs)["전체"].values
-    x = df["전장"].values
+    x = df["X"].values
     grid = np.arange(np.floor(x.min() / step) * step, x.max(), step)
     rows = []
     for t in grid:
         m = x >= t - 1e-9
         n = int(m.sum())
         if n:
-            rows.append({"전장 하한": round(float(t), 4), "시료 수": n, "합격률(%)": float(flags[m].mean() * 100)})
+            rows.append({"X 하한": round(float(t), 4), "시료 수": n, "합격률(%)": float(flags[m].mean() * 100)})
     return pd.DataFrame(rows)
 
 
 def recommend_threshold(curve: pd.DataFrame, target_pct: float, min_n: int):
-    """목표 합격률 이상이면서 시료 수가 min_n 이상인 가장 낮은 전장 하한. 없으면 None."""
+    """목표 합격률 이상이면서 시료 수가 min_n 이상인 가장 낮은 X 하한. 없으면 None."""
     sub = curve[(curve["합격률(%)"] >= target_pct) & (curve["시료 수"] >= min_n)]
     return None if sub.empty else sub.iloc[0]
 
@@ -910,10 +920,10 @@ def imr_charts(order, values, label, st_info, spec_lines=None, window=30):
 
 
 # ============================================================
-# 1-3. 조건 찾기: 입력(전장, 일자-Y) -> 결과(위치도 2종, 윤곽도) 예측 모델, 예측 정확도, 추천 조건, NG 시료 조정
-#   - 모델: 입력 2개로 결과 3개를 각각 회귀 (선형 또는 2차: 곡률 + 상호작용 포함)
-#   - OK 확률: 모델 예측값 + 실제 잔차(오차) 벡터를 재표본해서 '3개 스펙을 동시에' 만족할 확률을 구한다
-#     (결과 3개가 서로 상관돼 있어도 반영되고, 정규분포 가정이 필요 없다)
+# 1-3. 조건 찾기: 입력(X, Y) -> 결과(타겟 전부) 예측 모델, 예측 정확도, 추천 조건, NG 시료 조정
+#   - 모델: 입력 2개로 결과(타겟) 각각을 회귀 (선형 또는 2차: 곡률 + 상호작용 포함)
+#   - OK 확률: 모델 예측값 + 실제 잔차(오차) 벡터를 재표본해서 '모든 타겟 스펙을 동시에' 만족할 확률을 구한다
+#     (결과들이 서로 상관돼 있어도 반영되고, 정규분포 가정이 필요 없다)
 #   - 정확도는 모두 교차검증(학습에 쓰지 않은 시료로 평가) 값이다
 # ============================================================
 
@@ -943,7 +953,7 @@ def predict_condition(model, x, y):
 
 
 def pok_at(model, x, y, lo, hi):
-    """(x, y) 조건에서 결과 3개가 동시에 스펙 안에 들어올 확률 (잔차 재표본)."""
+    """(x, y) 조건에서 모든 결과가 동시에 스펙 안에 들어올 확률 (잔차 재표본)."""
     lo, hi = np.asarray(lo, float), np.asarray(hi, float)
     resid = model["resid"]
     pred = predict_condition(model, np.ravel(x), np.ravel(y))
@@ -1059,21 +1069,21 @@ def condition_map(x, y, tm, lo, hi, quad, xlim, ylim, wx, wy, min_n, target, ste
         if not supported.ravel()[o]:
             continue
         cx, cy = float(fx[o]), float(fy[o])
-        if all(abs(cx - t["전장"]) > 2 * wx or abs(cy - t["일자-Y"]) > 2 * wy for t in tops):
+        if all(abs(cx - t["X"]) > 2 * wx or abs(cy - t["Y"]) > 2 * wy for t in tops):
             near = (np.abs(x - cx) <= wx) & (np.abs(y - cy) <= wy)
-            tops.append({"전장": cx, "일자-Y": cy, "OK 확률(모델, %)": float(P.ravel()[o] * 100), "주변 실측 시료 수": int(near.sum()),
+            tops.append({"X": cx, "Y": cy, "OK 확률(모델, %)": float(P.ravel()[o] * 100), "주변 실측 시료 수": int(near.sum()),
                          "주변 실측 OK 비율(%)": float(ok_true[near].mean() * 100) if near.any() else float("nan")})
         if len(tops) >= 5:
             break
-    pred_top = predict_condition(model, [t["전장"] for t in tops], [t["일자-Y"] for t in tops]) if tops else np.empty((0, tm.shape[1]))
+    pred_top = predict_condition(model, [t["X"] for t in tops], [t["Y"] for t in tops]) if tops else np.empty((0, tm.shape[1]))
     return {"gx": gx, "gy": gy, "P": P, "cnt": cnt, "supported": supported, "rect": rect_info, "tops": pd.DataFrame(tops), "pred_top": pred_top,
             "step": step}
 
 
 @st.cache_data(show_spinner=False)
 def plan_adjustments(x, y, tm, lo, hi, quad, rmse, xlim, ylim, limx, limy, k, scales, step=0.01):
-    """스펙을 벗어난(NG) 시료마다, 허용 범위와 변경 한도 안에서 '가장 적게 바꿔서' 결과 3개가 모두 스펙 안에 들어갈 것으로
-    예측되는 (전장, 일자-Y) 를 찾는다. 시료마다 자기 고유의 오차(잔차)는 그대로 유지된다고 가정하고,
+    """스펙을 벗어난(NG) 시료마다, 허용 범위와 변경 한도 안에서 '가장 적게 바꿔서' 결과가 모두 스펙 안에 들어갈 것으로
+    예측되는 (X, Y) 를 찾는다. 시료마다 자기 고유의 오차(잔차)는 그대로 유지된다고 가정하고,
     스펙 경계에서 k × (교차검증 오차) 만큼 안쪽에 들어오도록 안전 여유를 둔다."""
     x, y, tm = np.asarray(x, float), np.asarray(y, float), np.asarray(tm, float)
     lo, hi, rmse = np.asarray(lo, float), np.asarray(hi, float), np.asarray(rmse, float)
@@ -1130,8 +1140,8 @@ def pok_heatmap(cm, min_n, rect=None, pts=None):
     d = pd.DataFrame({"x1": gxx.ravel() - step / 2, "x2": gxx.ravel() + step / 2, "y1": gyy.ravel() - step / 2, "y2": gyy.ravel() + step / 2,
                       "p": P.ravel() * 100, "n": cnt.ravel(), "cx": gxx.ravel(), "cy": gyy.ravel()})
     sup, uns = d[d["n"] >= min_n], d[d["n"] < min_n]
-    enc = dict(x=alt.X("x1:Q", title="전장", scale=alt.Scale(zero=False)), x2="x2:Q", y=alt.Y("y1:Q", title="일자-Y", scale=alt.Scale(zero=False)), y2="y2:Q")
-    tip = [alt.Tooltip("cx:Q", format=".2f", title="전장"), alt.Tooltip("cy:Q", format=".2f", title="일자-Y"),
+    enc = dict(x=alt.X("x1:Q", title="X", scale=alt.Scale(zero=False)), x2="x2:Q", y=alt.Y("y1:Q", title="Y", scale=alt.Scale(zero=False)), y2="y2:Q")
+    tip = [alt.Tooltip("cx:Q", format=".2f", title="X"), alt.Tooltip("cy:Q", format=".2f", title="Y"),
            alt.Tooltip("p:Q", format=".1f", title="OK 확률(모델, %)"), alt.Tooltip("n:Q", title="주변 실측 시료 수")]
     layers = []
     if len(uns):
@@ -1180,9 +1190,9 @@ def adjust_arrow_chart(cur, rec):
     seg = alt.Chart(rec.assign(x0=cur["x"].values, y0=cur["y"].values)).mark_rule(color="#9ca3af", opacity=0.55).encode(
         x="x0:Q", x2="x:Q", y="y0:Q", y2="y:Q")
     pts = alt.Chart(both).mark_circle(size=34, opacity=0.8).encode(
-        x=alt.X("x:Q", title="전장", scale=alt.Scale(zero=False)), y=alt.Y("y:Q", title="일자-Y", scale=alt.Scale(zero=False)),
+        x=alt.X("x:Q", title="X", scale=alt.Scale(zero=False)), y=alt.Y("y:Q", title="Y", scale=alt.Scale(zero=False)),
         color=alt.Color("kind:N", title=None, scale=alt.Scale(domain=["현재(NG)", "추천 조건"], range=[DANGER, SUCCESS])),
-        tooltip=[alt.Tooltip("sample:N", title="시료"), alt.Tooltip("x:Q", format=".3f", title="전장"), alt.Tooltip("y:Q", format=".3f", title="일자-Y")])
+        tooltip=[alt.Tooltip("sample:N", title="시료"), alt.Tooltip("x:Q", format=".3f", title="X"), alt.Tooltip("y:Q", format=".3f", title="Y")])
     return _dark(alt.layer(seg, pts), 400)
 
 
@@ -1298,7 +1308,7 @@ def render_header():
             <div>
                 <div style='color:{ACCENT_BLUE};font-size:2.04rem;font-weight:700;letter-spacing:0.02em;margin-bottom:4px;line-height:1.2;'>WELDING ARM 측정 데이터 분석</div>
                 <div style='display:flex;align-items:baseline;gap:10px;margin-bottom:2px;'>
-                    <span style='color:{TEXT_MAIN};font-size:1.3rem;font-weight:700;border-bottom:2px solid {ACCENT_BLUE};padding-bottom:2px;'>타겟 스펙 만족 시료의 전장 · 일자-Y Min / Max 추출</span>
+                    <span style='color:{TEXT_MAIN};font-size:1.3rem;font-weight:700;border-bottom:2px solid {ACCENT_BLUE};padding-bottom:2px;'>타겟 스펙 만족 시료의 X · Y Min / Max 추출</span>
                     <span style='color:{TEXT_MUTED};font-size:0.85rem;'>V1.0</span>
                 </div>
                 <div style='color:{TEXT_MUTED};font-size:0.85rem;'>
@@ -1368,18 +1378,19 @@ def _kpi(label, value, sub="", color=None):
 def _cols_table(cols, info=None):
     rows = [
         {"구분": v["kind"], "항목": k, "인식한 머리글": v["header"], "값 열": get_column_letter(v["value_col"] + 1),
-         "편차 열": get_column_letter(v["dev_col"] + 1) if v["dev_col"] is not None else "-"}
+         "편차 열": get_column_letter(v["dev_col"] + 1) if v["dev_col"] is not None else "-",
+         "비고": "크기(절댓값)로 판정 - 엑셀 값은 음수" if v.get("abs") else ""}
         for k, v in cols.items()
     ]
     for side, d in ((info or {}).get("end_cols") or {}).items():
         rows.append({"구분": "끝단", "항목": f"{side} 원주 {len(d['cols'])}점",
                      "인식한 머리글": f"{d['headers'][0]} ~ {d['headers'][-1]}",
-                     "값 열": ", ".join(get_column_letter(c + 1) for c in d["cols"]), "편차 열": "-"})
+                     "값 열": ", ".join(get_column_letter(c + 1) for c in d["cols"]), "편차 열": "-", "비고": ""})
     return pd.DataFrame(rows)
 
 
 with tab_main:
-    st.markdown('<div class="block-title">분석 조건 · 타겟 항목 스펙 (3개 모두 만족)</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="block-title">분석 조건 · 타겟 항목 스펙 ({len(st.session_state["target_rules"])}개 모두 만족)</div>', unsafe_allow_html=True)
     specs = {}
     _tcols = st.columns(len(st.session_state["target_rules"]))
     for _holder, _key in zip(_tcols, st.session_state["target_rules"]):
@@ -1390,7 +1401,10 @@ with tab_main:
             _lo = _c1.number_input("하한", value=float(_d_lo), step=0.1, format="%.3f", key=f"spec_lo_{_key}")
             _hi = _c2.number_input("상한", value=float(_d_hi), step=0.1, format="%.3f", key=f"spec_hi_{_key}")
             specs[_key] = (_lo, _hi)
-    st.caption("하한/상한 경계값도 합격에 포함됩니다. 변수 항목은 전장, 일자-Y 입니다.")
+            if _key in DEFAULT_TARGET_ABS:
+                st.checkbox("크기(절댓값)로 판정", value=DEFAULT_TARGET_ABS[_key], key=f"spec_abs_{_key}",
+                            help="엑셀에 -9.38 처럼 음수로 기록된 값을 스펙(양수 범위)과 비교하려면 켜세요. 끄면 원래 값 그대로 비교합니다.")
+    st.caption("하한/상한 경계값도 합격에 포함됩니다. 변수 항목은 X, Y 입니다.")
 
     if data_bytes is None:
         st.info("왼쪽 사이드바 STEP 1에서 측정 데이터 엑셀을 먼저 업로드해주세요.")
@@ -1400,6 +1414,7 @@ with tab_main:
         _target_rules = dict(st.session_state["target_rules"])
         _name_pat = st.session_state["name_pattern"]
         _end_rules = dict(st.session_state["end_rules"])
+        _abs_targets = {k for k in _target_rules if st.session_state.get(f"spec_abs_{k}", DEFAULT_TARGET_ABS.get(k, False))}
         _file_name = data_file.name
         _specs = dict(specs)
 
@@ -1407,8 +1422,8 @@ with tab_main:
             update_progress("엑셀 파일을 읽는 중...")
             raw = _load_raw_sheet(data_bytes, sheet_name)
             update_progress("타겟/변수 열을 찾고 시료 행만 추리는 중...")
-            df, cols, info = prepare_dataset(raw, _var_rules, _target_rules, _name_pat, _end_rules)
-            update_progress("3개 타겟 스펙을 모두 만족하는 시료를 고르는 중...")
+            df, cols, info = prepare_dataset(raw, _var_rules, _target_rules, _name_pat, _end_rules, _abs_targets)
+            update_progress(f"{len(_specs)}개 타겟 스펙을 모두 만족하는 시료를 고르는 중...")
             summary, subset, status_df = analyze_spec(df, _specs, list(_var_rules))
             end_summary = end_extent_summary(subset) if (info.get("has_end") and not subset.empty) else None
             update_progress("참고용 합격 보장 범위(불합격 0개)를 찾는 중...")
@@ -1417,12 +1432,12 @@ with tab_main:
             win = find_pass_window(df, _flags, _vk[0], _vk[1]) if len(_vk) >= 2 else None
             update_progress("허용 불합격률별 범위를 비교하는 중...")
             trade = window_tradeoff(df, _flags, _vk[0], _vk[1]) if win is not None else []
-            trade_end = window_tradeoff(df, _flags, "양 끝단 포함 전장", _vk[1]) if (win is not None and "양 끝단 포함 전장" in df.columns and df["양 끝단 포함 전장"].notna().all()) else []
+            trade_end = window_tradeoff(df, _flags, "양 끝단 포함 X", _vk[1]) if (win is not None and "양 끝단 포함 X" in df.columns and df["양 끝단 포함 X"].notna().all()) else []
 
             update_progress("결과 파일 만드는 중...")
             spec_txt = " / ".join(f"{k} {min(v):g}~{max(v):g}" for k, v in _specs.items())
             params = {
-                "데이터 파일": _file_name, "시트": sheet_name, "타겟 스펙(경계 포함)": spec_txt,
+                "데이터 파일": _file_name, "시트": sheet_name, "타겟 스펙(경계 포함)": spec_txt, "크기(절댓값)로 판정한 타겟": ", ".join(sorted(_abs_targets)) or "-",
                 "변수 항목": ", ".join(_var_rules), "유효 시료 수": info["n_samples"], "스펙 합격 시료 수": len(subset),
             }
             st.session_state["mm_result"] = {
@@ -1441,8 +1456,8 @@ with tab_main:
                     r = summary[(summary["항목"] == key) & (summary["구분"] == "측정값")].iloc[0]
                     rec[f"{key} 최종 Min ~ Max"] = f"{r['Min']:.4f} ~ {r['Max']:.4f}"
             if end_summary is not None and not end_summary.empty:
-                _e = end_summary[end_summary["항목"] == "양 끝단 포함 전장"].iloc[0]
-                rec["양 끝단 포함 전장 Min ~ Max"] = f"{_e['Min']:.4f} ~ {_e['Max']:.4f}"
+                _e = end_summary[end_summary["항목"] == "양 끝단 포함 X"].iloc[0]
+                rec["양 끝단 포함 X Min ~ Max"] = f"{_e['Min']:.4f} ~ {_e['Max']:.4f}"
             if win is not None:
                 rec[f"{win['xkey']} 보장범위(참고)"] = f"{win['x'][0]:.4f} ~ {win['x'][1]:.4f}"
                 rec[f"{win['ykey']} 보장범위(참고)"] = f"{win['y'][0]:.4f} ~ {win['y'][1]:.4f}"
@@ -1462,9 +1477,9 @@ with tab_main:
             with st.expander("상세 오류"):
                 st.code(_tb)
         elif _res["n_in"] == 0:
-            st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없습니다. 스펙 값을 확인해주세요.")
+            st.warning("모든 타겟 스펙을 만족하는 시료가 없습니다. 스펙 값을 확인해주세요.")
         else:
-            st.success(f"3개 타겟 스펙을 모두 만족하는 시료 {_res['n_in']}건으로 전장 · 일자-Y 최종 Min/Max를 계산했습니다. 아래 결과를 확인하세요.")
+            st.success(f"타겟 스펙을 모두 만족하는 시료 {_res['n_in']}건으로 X · Y 최종 Min/Max를 계산했습니다. 아래 결과를 확인하세요.")
 
     st.markdown("<hr>", unsafe_allow_html=True)
     res = st.session_state.get("mm_result")
@@ -1477,9 +1492,9 @@ with tab_main:
         pct = (n_in / n_all * 100) if n_all else 0
 
         k1, k2, k3, k4 = st.columns(4)
-        k1.markdown(_kpi("합격 조건", "3개 타겟 동시 만족", "단축·장축 위치도, 단축 윤곽도"), unsafe_allow_html=True)
+        k1.markdown(_kpi("합격 조건", f"{len(res['specs'])}개 타겟 동시 만족", ", ".join(res["specs"])), unsafe_allow_html=True)
         k2.markdown(_kpi("유효 시료 수", f"{n_all}개", "엑셀 시료 행 기준"), unsafe_allow_html=True)
-        k3.markdown(_kpi("스펙 합격(OK) 시료 수", f"{n_in}개", "3개 타겟 스펙 모두 만족", color=SUCCESS if n_in else WARNING), unsafe_allow_html=True)
+        k3.markdown(_kpi("스펙 합격(OK) 시료 수", f"{n_in}개", "모든 타겟 스펙 만족", color=SUCCESS if n_in else WARNING), unsafe_allow_html=True)
         k4.markdown(_kpi("합격률", f"{pct:.1f}%", "합격 시료 ÷ 유효 시료"), unsafe_allow_html=True)
 
         notes = []
@@ -1491,9 +1506,9 @@ with tab_main:
             st.caption(" · ".join(notes))
 
         st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-        st.markdown('<div class="block-title">① 합격(OK) 시료의 최종 Min / Max — 전장 · 일자-Y</div>', unsafe_allow_html=True)
+        st.markdown('<div class="block-title">① 합격(OK) 시료의 최종 Min / Max — X · Y</div>', unsafe_allow_html=True)
         if summary.empty:
-            st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없어 Min/Max를 계산하지 못했습니다.")
+            st.warning("모든 타겟 스펙을 만족하는 시료가 없어 Min/Max를 계산하지 못했습니다.")
         else:
             vals = summary[summary["구분"] == "측정값"].set_index("항목")
             card_cols = st.columns(2 * len(res["var_keys"]))
@@ -1509,7 +1524,7 @@ with tab_main:
             st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
             _xk, _yk = res["var_keys"][0], res["var_keys"][1]
             st.success(
-                f"3개 스펙을 모두 만족한 시료 {n_in}개를 하나씩 모아, 그 중 가장 작은 값과 가장 큰 값을 최종 Min/Max로 정했습니다. "
+                f"타겟 스펙을 모두 만족한 시료 {n_in}개를 하나씩 모아, 그 중 가장 작은 값과 가장 큰 값을 최종 Min/Max로 정했습니다. "
                 f"따라서 합격 시료 {n_in}개는 전부 이 범위 안에 들어옵니다 "
                 f"({_xk} {vals.loc[_xk, 'Min']:.4f} ~ {vals.loc[_xk, 'Max']:.4f}, {_yk} {vals.loc[_yk, 'Min']:.4f} ~ {vals.loc[_yk, 'Max']:.4f}).")
             _flags = pass_matrix(res["df"], res["specs"])["전체"].values
@@ -1521,35 +1536,35 @@ with tab_main:
             st.dataframe(summary, use_container_width=True, hide_index=True, column_config=num_cfg)
 
         st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-        st.markdown('<div class="block-title">② 양 끝단(파이프 기울기)을 포함한 전장 Min / Max — 지그 전장 치수용</div>', unsafe_allow_html=True)
+        st.markdown('<div class="block-title">② 양 끝단(파이프 기울기)을 포함한 X Min / Max — 지그 X 치수용</div>', unsafe_allow_html=True)
         esum = res.get("end_summary")
         if esum is None or esum.empty:
-            st.info("엑셀에서 Y-값_단1~8 / Y-값_장1~8 열을 찾지 못해 계산하지 않았습니다 (분석 설정 관리 탭에서 끝단 열 이름 규칙을 확인할 수 있습니다).")
+            st.info("엑셀에서 단축 / 장축 파이프 기울기 1~8 열을 찾지 못해 계산하지 않았습니다 (분석 설정 관리 탭에서 끝단 열 이름 규칙을 확인할 수 있습니다).")
         else:
             ev = esum.set_index("항목")
             ec = st.columns(4)
-            _lr = ev.loc["양 끝단 포함 전장"]
-            ec[0].markdown(_kpi("포함 전장 Min", f"{_lr['Min']:.4f}", f"{_lr['Min 시료']} (엑셀 {_lr['Min 엑셀 행']}행)"), unsafe_allow_html=True)
-            ec[1].markdown(_kpi("포함 전장 Max", f"{_lr['Max']:.4f}", f"{_lr['Max 시료']} (엑셀 {_lr['Max 엑셀 행']}행)"), unsafe_allow_html=True)
+            _lr = ev.loc["양 끝단 포함 X"]
+            ec[0].markdown(_kpi("포함 X Min", f"{_lr['Min']:.4f}", f"{_lr['Min 시료']} (엑셀 {_lr['Min 엑셀 행']}행)"), unsafe_allow_html=True)
+            ec[1].markdown(_kpi("포함 X Max", f"{_lr['Max']:.4f}", f"{_lr['Max 시료']} (엑셀 {_lr['Max 엑셀 행']}행)"), unsafe_allow_html=True)
             if "기울기 증가량" in ev.index:
                 _gr = ev.loc["기울기 증가량"]
-                ec[2].markdown(_kpi("기울기로 늘어난 길이 (평균)", f"+{_gr['평균']:.4f}", "포함 전장 − 전장(중심 기준)"), unsafe_allow_html=True)
+                ec[2].markdown(_kpi("기울기로 늘어난 길이 (평균)", f"+{_gr['평균']:.4f}", "포함 X − X(중심 기준)"), unsafe_allow_html=True)
                 ec[3].markdown(_kpi("기울기로 늘어난 길이 (최대)", f"+{_gr['Max']:.4f}", f"{_gr['Max 시료']} (엑셀 {_gr['Max 엑셀 행']}행)"), unsafe_allow_html=True)
             st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
             _w = res["info"].get("end_cols", {})
             _nl, _nr = len(_w.get("왼쪽 끝단", {}).get("cols", [])), len(_w.get("오른쪽 끝단", {}).get("cols", []))
             st.success(
-                f"합격(OK) 시료 {n_in}개 각각에서, 왼쪽 끝단 원주 {_nl}점(Y-값_단) 중 가장 왼쪽 값과 오른쪽 끝단 원주 {_nr}점(Y-값_장) 중 가장 오른쪽 값 사이의 거리"
-                f"(= 전장 + 양쪽 끝단이 기울어서 튀어나온 길이)를 구해, 그 최소 {_lr['Min']:.4f} ~ 최대 {_lr['Max']:.4f} 로 정했습니다. "
-                f"가장 긴 합격 제품이 들어가려면 지그의 전장 방향 치수는 {_lr['Max']:.4f} 이상을 포함해야 합니다.")
+                f"합격(OK) 시료 {n_in}개 각각에서, 왼쪽(단축) 끝단 원주 {_nl}점(단축 파이프 기울기) 중 가장 왼쪽 값과 오른쪽(장축) 끝단 원주 {_nr}점(장축 파이프 기울기) 중 가장 오른쪽 값 사이의 거리"
+                f"(= X + 양쪽 끝단이 기울어서 튀어나온 길이)를 구해, 그 최소 {_lr['Min']:.4f} ~ 최대 {_lr['Max']:.4f} 로 정했습니다. "
+                f"가장 긴 합격 제품이 들어가려면 지그의 X 방향 치수는 {_lr['Max']:.4f} 이상을 포함해야 합니다.")
             if res["info"].get("n_end_incomplete"):
                 st.caption(f"끝단 측정점이 일부 비어 있는 시료 {res['info']['n_end_incomplete']}개는 있는 점만으로 계산했습니다.")
             if len(subset) >= 3:
-                st.altair_chart(hist_chart(subset["양 끝단 포함 전장"], "양 끝단 포함 전장 (합격 시료)", [("Min", float(_lr["Min"])), ("Max", float(_lr["Max"]))]),
+                st.altair_chart(hist_chart(subset["양 끝단 포함 X"], "양 끝단 포함 X (합격 시료)", [("Min", float(_lr["Min"])), ("Max", float(_lr["Max"]))]),
                                 use_container_width=True, theme=None)
             ecfg = {c: st.column_config.NumberColumn(format="%.4f") for c in ("Min", "Max", "평균", "Max-Min")}
             st.dataframe(esum, use_container_width=True, hide_index=True, column_config=ecfg)
-            st.caption("양 끝단 포함 전장 = 오른쪽 최외측 Y(가장 큰 값) − 왼쪽 최외측 Y(가장 작은 값). '안쪽 전장'은 양 끝단이 가장 가까워지는 길이(오른쪽 최내측 − 왼쪽 최내측)로, "
+            st.caption("양 끝단 포함 X = 오른쪽 최외측 Y(가장 큰 값) − 왼쪽 최외측 Y(가장 작은 값). '안쪽 X'은 양 끝단이 가장 가까워지는 길이(오른쪽 최내측 − 왼쪽 최내측)로, "
                        "지그에 걸림(스토퍼)이 있을 때 참고하세요. 지그 구조에 따라 필요한 치수가 달라질 수 있습니다.")
 
         st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
@@ -1561,7 +1576,7 @@ with tab_main:
 
         with st.expander("④ 참고 · 이 범위 안이면 반드시 합격인 더 좁은 범위 (불합격 0개, Go/No-Go 게이지용)", expanded=False):
             if win is None:
-                st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없어 범위를 찾지 못했습니다.")
+                st.warning("모든 타겟 스펙을 만족하는 시료가 없어 범위를 찾지 못했습니다.")
             else:
                 xk, yk = win["xkey"], win["ykey"]
                 st.caption(
@@ -1576,7 +1591,7 @@ with tab_main:
                 if win["n_fail_in"] == 0:
                     st.success(
                         f"{xk} {win['x'][0]:.4f} ~ {win['x'][1]:.4f} 이면서 {yk} {win['y'][0]:.4f} ~ {win['y'][1]:.4f} 인 시료는 "
-                        f"{win['n_in']}개이고, 전부 3개 타겟 스펙을 만족합니다 (불합격 0개). "
+                        f"{win['n_in']}개이고, 전부 모든 타겟 스펙을 만족합니다 (불합격 0개). "
                         f"합격 시료 {win['n_pass']}개 중 {win['n_pass_in']}개({win['n_pass_in'] / win['n_pass'] * 100:.1f}%)를 포함합니다.")
                 else:
                     st.warning(f"범위 안에 불합격 시료가 {win['n_fail_in']}개 섞여 있습니다. 데이터를 확인해주세요.")
@@ -1599,16 +1614,16 @@ with tab_samples:
     if _r is None:
         st.info("아직 분석 결과가 없습니다. Tab 1에서 타겟 스펙을 확인하고 'Min/Max 분석 실행'을 눌러주세요.")
     else:
-        st.markdown('<div class="block-title">① 스펙 합격 시료 전체 (전장 오름차순)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="block-title">① 스펙 합격 시료 전체 (X 오름차순)</div>', unsafe_allow_html=True)
         if _r["subset"].empty:
-            st.warning("3개 타겟 스펙을 모두 만족하는 시료가 없습니다.")
+            st.warning("모든 타겟 스펙을 만족하는 시료가 없습니다.")
         else:
-            st.caption(f"3개 타겟 스펙을 모두 만족하는 시료 {len(_r['subset'])}개 (유효 시료 {_r['info']['n_samples']}개 중) · 조건: {_r['spec_txt']}")
+            st.caption(f"모든 타겟 스펙을 만족하는 시료 {len(_r['subset'])}개 (유효 시료 {_r['info']['n_samples']}개 중) · 조건: {_r['spec_txt']}")
             st.dataframe(_r["subset"], use_container_width=True, hide_index=True)
 
         st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
         st.markdown('<div class="block-title">② 인식된 열 정보</div>', unsafe_allow_html=True)
-        st.caption("엑셀 머리글에서 찾은 변수(전장, 일자-Y)와 타겟(위치도, 윤곽도) 항목의 열 위치입니다.")
+        st.caption("엑셀 머리글에서 찾은 변수(X, Y)와 타겟(위치도, 윤곽도) 항목의 열 위치입니다.")
         st.dataframe(_cols_table(_r["cols"], _r["info"]), use_container_width=True, hide_index=True)
 
 
@@ -1630,14 +1645,14 @@ def _pick_dataset(r, key):
 
 
 def _spec_lines_for(r, k):
-    """분포/관리도 차트에 그릴 기준선. 타겟은 실행 때 쓴 스펙(상한), 전장·일자-Y 는 기준값만."""
+    """분포/관리도 차트에 그릴 기준선. 타겟은 실행 때 쓴 스펙(상한), X·Y 는 기준값만."""
     lines = []
     if k in r["specs"]:
         lo, hi = sorted(r["specs"][k])
         if lo > 0:
             lines.append(("LSL", lo))
         lines.append(("USL", hi))
-    else:  # 전장·일자-Y: 규격(공차)이 없는 관리 변수 -> 머리글에 적힌 기준값만 참고선으로 표시
+    else:  # X·Y: 규격(공차)이 없는 관리 변수 -> 머리글에 적힌 기준값만 참고선으로 표시
         nom = (r.get("nominals") or {}).get(k)
         if nom is not None:
             lines.append(("기준값", nom))
@@ -1651,11 +1666,11 @@ with tab_cond:
         dfc, specs = r["df"], r["specs"]
         xk, yk = r["var_keys"][0], r["var_keys"][1]
         xmode = "c"
-        if "양 끝단 포함 전장" in dfc.columns and dfc["양 끝단 포함 전장"].notna().all():
-            _xsel = st.radio("전장 기준", ["중심 기준 전장", "양 끝단 포함 전장 (지그 치수용)"], horizontal=True, key="cond_xbasis",
-                             help="양 끝단 포함 전장 = 오른쪽 끝단 최외측 Y − 왼쪽 끝단 최외측 Y (파이프 기울기로 튀어나온 길이 포함). 지그는 이 값을 기준으로 만들어야 제품이 들어갑니다.")
+        if "양 끝단 포함 X" in dfc.columns and dfc["양 끝단 포함 X"].notna().all():
+            _xsel = st.radio("X 기준", ["중심 기준 X", "양 끝단 포함 X (지그 치수용)"], horizontal=True, key="cond_xbasis",
+                             help="양 끝단 포함 X = 오른쪽 끝단 최외측 Y − 왼쪽 끝단 최외측 Y (파이프 기울기로 튀어나온 길이 포함). 지그는 이 값을 기준으로 만들어야 제품이 들어갑니다.")
             if _xsel.startswith("양 끝단"):
-                xk, xmode = "양 끝단 포함 전장", "e"
+                xk, xmode = "양 끝단 포함 X", "e"
         tg = list(specs)
         xa, ya = dfc[xk].to_numpy(dtype=float), dfc[yk].to_numpy(dtype=float)
         tm = dfc[tg].to_numpy(dtype=float)
@@ -1663,7 +1678,7 @@ with tab_cond:
         hi = np.array([max(specs[k]) for k in tg])
 
         st.caption(
-            f"{xk}·{yk} 를 입력 변수, {', '.join(tg)} 를 결과값으로 보고, 이번 데이터의 경향으로 '결과가 3개 스펙을 모두 만족하려면 입력을 어떻게 맞춰야 하는지'를 찾습니다. "
+            f"{xk}·{yk} 를 입력 변수, {', '.join(tg)} 를 결과값으로 보고, 이번 데이터의 경향으로 '결과가 모든 타겟 스펙을 만족하려면 입력을 어떻게 맞춰야 하는지'를 찾습니다. "
             "① 예측이 얼마나 믿을 만한지 확인하고, ② 스펙을 만족할 가능성이 높은 입력 조건(작업 구간)을 찾고, ③ 현재 NG 시료의 입력을 얼마나 바꾸면 되는지 추정합니다.")
         mdl = st.radio("예측 모델", ["2차 모델 (곡률 · 상호작용 포함)", "선형 모델"], horizontal=True, key="cond_model")
         quad = mdl.startswith("2차")
@@ -1715,7 +1730,7 @@ with tab_cond:
         st.markdown("<hr>", unsafe_allow_html=True)
 
         # ---------------- ② 추천 조건 ----------------
-        st.markdown('<div class="block-title">② 3개 스펙을 만족할 가능성이 높은 입력 조건 (추천 작업 구간)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="block-title">② 모든 타겟 스펙을 만족할 가능성이 높은 입력 조건 (추천 작업 구간)</div>', unsafe_allow_html=True)
         xmin_d, xmax_d = float(np.floor(xa.min() * 100) / 100), float(np.ceil(xa.max() * 100) / 100)
         ymin_d, ymax_d = float(np.floor(ya.min() * 100) / 100), float(np.ceil(ya.max() * 100) / 100)
         p1, p2, p3, p4 = st.columns(4)
@@ -1750,12 +1765,12 @@ with tab_cond:
                 st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
                 st.success(
                     f"{xk} {rect['x'][0]:.2f} ~ {rect['x'][1]:.2f} mm, {yk} {rect['y'][0]:.2f} ~ {rect['y'][1]:.2f} mm 로 맞추면 "
-                    f"3개 스펙을 모두 만족할 확률이 모델 기준 {rect['p_min'] * 100:.0f}% 이상입니다. "
+                    f"모든 타겟 스펙을 만족할 확률이 모델 기준 {rect['p_min'] * 100:.0f}% 이상입니다. "
                     f"이번 데이터에서 이 구간에 들어온 실제 시료는 {rect['n_real']}개이고 그 중 {rect['ok_real']}개({real_rate:.1f}%)가 OK 였습니다.")
             show_pts = st.checkbox("실측 시료 점 표시", value=False, key="cond_show_pts")
             pts_df = pd.DataFrame({"x": xa, "y": ya, "status": np.where(np.all((tm >= lo) & (tm <= hi), axis=1), "OK", "NG")}) if show_pts else None
             st.altair_chart(pok_heatmap(cmap, int(min_n), rect, pts_df), use_container_width=True, theme=None)
-            st.caption("칸의 색이 초록일수록 그 입력 조건에서 3개 스펙을 모두 만족할 확률(모델 추정)이 높습니다. 회색 칸은 주변에 실측 시료가 부족해서 "
+            st.caption("칸의 색이 초록일수록 그 입력 조건에서 모든 타겟 스펙을 만족할 확률(모델 추정)이 높습니다. 회색 칸은 주변에 실측 시료가 부족해서 "
                        "추천하지 않는 곳이고, 흰색 사각형이 추천 작업 구간입니다.")
 
             top_df = cmap["tops"]
@@ -1793,7 +1808,7 @@ with tab_cond:
                 dx = plan["nx"].to_numpy() - xa[pos]
                 dy = plan["ny"].to_numpy() - ya[pos]
                 s1, s2, s3, s4 = st.columns(4)
-                s1.markdown(_kpi("현재 NG 시료", f"{n_ng}개", "3개 스펙 중 하나 이상 벗어남"), unsafe_allow_html=True)
+                s1.markdown(_kpi("현재 NG 시료", f"{n_ng}개", "스펙 중 하나 이상 벗어남"), unsafe_allow_html=True)
                 s2.markdown(_kpi("조정으로 OK 가능(추정)", f"{int(feas.sum())}개", f"NG 의 {feas.mean() * 100:.0f}% · 불가 {int((~feas).sum())}개",
                                  color=SUCCESS if feas.mean() >= 0.7 else WARNING), unsafe_allow_html=True)
                 s3.markdown(_kpi(f"{xk} 변경량 (중앙값)", f"{np.nanmedian(dx):+.3f} mm" if feas.any() else "-",
@@ -1827,7 +1842,7 @@ with tab_cond:
 
                 rect_df = None
                 if rect is not None:
-                    rect_df = pd.DataFrame([{"전장 하한": rect["x"][0], "전장 상한": rect["x"][1], "일자-Y 하한": rect["y"][0], "일자-Y 상한": rect["y"][1],
+                    rect_df = pd.DataFrame([{"X 하한": rect["x"][0], "X 상한": rect["x"][1], "Y 하한": rect["y"][0], "Y 상한": rect["y"][1],
                                              "구간 내 최소 OK 확률(모델,%)": rect["p_min"] * 100, "구간 안 실측 시료 수": rect["n_real"], "그 중 OK": rect["ok_real"]}])
                 cls_df = pd.DataFrame({"": ["실제 OK", "실제 NG"], "예측 OK": [cv["tp"], cv["fp"]], "예측 NG": [cv["fn"], cv["tn"]]})
                 params = {"예측 모델": mdl, "목표 OK 확률(%)": target, "최소 근거 시료 수": int(min_n), f"근거 창 {xk}±": wx, f"근거 창 {yk}±": wy,
@@ -1850,8 +1865,8 @@ with tab_gauge:
         trade_end = r.get("tradeoff_end")
         gbasis = "c"
         if trade and trade_end:
-            _gsel = st.radio("전장 기준", ["중심 기준 전장", "양 끝단 포함 전장 (지그 치수용)"], horizontal=True, key="gauge_basis",
-                             help="양 끝단 포함 전장 = 오른쪽 끝단 최외측 Y − 왼쪽 끝단 최외측 Y (파이프 기울기로 튀어나온 길이 포함). 지그는 이 값을 기준으로 만들어야 제품이 들어갑니다.")
+            _gsel = st.radio("X 기준", ["중심 기준 X", "양 끝단 포함 X (지그 치수용)"], horizontal=True, key="gauge_basis",
+                             help="양 끝단 포함 X = 오른쪽 끝단 최외측 Y − 왼쪽 끝단 최외측 Y (파이프 기울기로 튀어나온 길이 포함). 지그는 이 값을 기준으로 만들어야 제품이 들어갑니다.")
             if _gsel.startswith("양 끝단"):
                 trade, gbasis = trade_end, "e"
         if not trade:
@@ -1948,11 +1963,11 @@ with tab_analysis:
     r = _analysis_result()
     if r is not None:
         st.caption("항목을 눌러 펼치면 해당 분석이 표시됩니다 (기본은 모두 닫혀 있음). 전부 Tab 1 에서 실행한 같은 데이터로 계산합니다.")
-        with st.expander("전장 구간별 합격률", expanded=False):
+        with st.expander("X 구간별 합격률", expanded=False):
             df_all, specs = r["df"], r["specs"]
             st.markdown('<div class="block-title">분석 조건</div>', unsafe_allow_html=True)
             b1, b2, b3 = st.columns(3)
-            width = b1.select_slider("전장 구간 폭 (mm)", options=[0.05, 0.1, 0.2, 0.25, 0.5], value=0.1, key="bin_width")
+            width = b1.select_slider("X 구간 폭 (mm)", options=[0.05, 0.1, 0.2, 0.25, 0.5], value=0.1, key="bin_width")
             target_pct = b2.slider("목표 합격률 (%)", 50, 100, 90, key="bin_target")
             min_n = b3.number_input("최소 시료 수 (신뢰 기준)", min_value=5, max_value=500, value=30, step=5, key="bin_min_n")
 
@@ -1964,27 +1979,27 @@ with tab_analysis:
             k1, k2, k3, k4 = st.columns(4)
             k1.markdown(_kpi("전체 합격률", f"{overall:.1f}%", f"{len(r['subset'])}개 / {len(df_all)}개"), unsafe_allow_html=True)
             if rec is not None:
-                k2.markdown(_kpi("권장 전장 하한", f"{rec['전장 하한']:.2f} mm", f"합격률 {target_pct}% 이상 · 시료 {int(min_n)}개 이상", color=SUCCESS), unsafe_allow_html=True)
+                k2.markdown(_kpi("권장 X 하한", f"{rec['X 하한']:.2f} mm", f"합격률 {target_pct}% 이상 · 시료 {int(min_n)}개 이상", color=SUCCESS), unsafe_allow_html=True)
                 k3.markdown(_kpi("그 하한에서의 합격률", f"{rec['합격률(%)']:.1f}%", f"전체 대비 {rec['합격률(%)'] - overall:+.1f}%p"), unsafe_allow_html=True)
                 k4.markdown(_kpi("그 하한 이상 시료 수", f"{int(rec['시료 수'])}개", f"전체의 {rec['시료 수'] / len(df_all) * 100:.0f}%"), unsafe_allow_html=True)
             else:
-                k2.markdown(_kpi("권장 전장 하한", "없음", "목표를 만족하는 구간 없음", color=WARNING), unsafe_allow_html=True)
+                k2.markdown(_kpi("권장 X 하한", "없음", "목표를 만족하는 구간 없음", color=WARNING), unsafe_allow_html=True)
                 ok_curve = curve[curve["시료 수"] >= int(min_n)]
                 best = ok_curve.loc[ok_curve["합격률(%)"].idxmax()] if not ok_curve.empty else None
                 k3.markdown(_kpi("달성 가능한 최대 합격률", f"{best['합격률(%)']:.1f}%" if best is not None else "-",
-                                 f"전장 {best['전장 하한']:.2f} mm 이상" if best is not None else ""), unsafe_allow_html=True)
+                                 f"X {best['X 하한']:.2f} mm 이상" if best is not None else ""), unsafe_allow_html=True)
                 k4.markdown(_kpi("목표 합격률", f"{target_pct}%"), unsafe_allow_html=True)
 
             st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-            st.markdown('<div class="block-title">① 전장 구간별 합격률</div>', unsafe_allow_html=True)
-            cdf = pd.DataFrame({"label": table["전장 구간"], "rate": table["합격률(%)"], "n": table["시료 수"], "ok": table["합격 수"]})
+            st.markdown('<div class="block-title">① X 구간별 합격률</div>', unsafe_allow_html=True)
+            cdf = pd.DataFrame({"label": table["X 구간"], "rate": table["합격률(%)"], "n": table["시료 수"], "ok": table["합격 수"]})
             cdf["level"] = np.where(cdf["n"] < int(min_n), "표본 부족",
                                     np.where(cdf["rate"] >= target_pct, "목표 이상", "목표 미만"))
             bars = alt.Chart(cdf).mark_bar().encode(
-                x=alt.X("label:N", sort=None, title="전장 구간 (mm)"),
+                x=alt.X("label:N", sort=None, title="X 구간 (mm)"),
                 y=alt.Y("rate:Q", title="합격률 (%)", scale=alt.Scale(domain=[0, 105])),
                 color=alt.Color("level:N", title="구분", scale=alt.Scale(domain=["목표 이상", "목표 미만", "표본 부족"], range=[SUCCESS, ACCENT_BLUE, "#4b5563"])),
-                tooltip=[alt.Tooltip("label:N", title="전장 구간"), alt.Tooltip("rate:Q", format=".1f", title="합격률(%)"),
+                tooltip=[alt.Tooltip("label:N", title="X 구간"), alt.Tooltip("rate:Q", format=".1f", title="합격률(%)"),
                          alt.Tooltip("ok:Q", title="합격 수"), alt.Tooltip("n:Q", title="시료 수")])
             labels = alt.Chart(cdf).mark_text(dy=-8, color="#cbd5e1", fontSize=11).encode(
                 x=alt.X("label:N", sort=None), y="rate:Q", text=alt.Text("n:Q"))
@@ -1993,20 +2008,20 @@ with tab_analysis:
             st.altair_chart(_dark(alt.layer(bars, labels, goal), 340), use_container_width=True, theme=None)
             st.caption("막대 위 숫자는 구간의 시료 수입니다. 회색 막대는 시료 수가 최소 기준보다 적어 신뢰하기 어려운 구간입니다.")
 
-            st.markdown('<div class="block-title">② 전장 하한을 올렸을 때의 합격률 (누적)</div>', unsafe_allow_html=True)
-            cc = curve[curve["시료 수"] >= int(min_n)].rename(columns={"전장 하한": "thr", "시료 수": "n", "합격률(%)": "rate"})
+            st.markdown('<div class="block-title">② X 하한을 올렸을 때의 합격률 (누적)</div>', unsafe_allow_html=True)
+            cc = curve[curve["시료 수"] >= int(min_n)].rename(columns={"X 하한": "thr", "시료 수": "n", "합격률(%)": "rate"})
             if cc.empty:
                 st.info("최소 시료 수 기준을 만족하는 구간이 없습니다. 기준을 낮춰보세요.")
             else:
                 cl = alt.Chart(cc).mark_line(color=ACCENT_BLUE, strokeWidth=2.5, point=alt.OverlayMarkDef(color=ACCENT_BLUE, size=30)).encode(
-                    x=alt.X("thr:Q", title="전장 하한 (mm) — 이 값 이상인 시료만 남김", scale=alt.Scale(zero=False)),
+                    x=alt.X("thr:Q", title="X 하한 (mm) — 이 값 이상인 시료만 남김", scale=alt.Scale(zero=False)),
                     y=alt.Y("rate:Q", title="합격률 (%)", scale=alt.Scale(domain=[0, 105])),
-                    tooltip=[alt.Tooltip("thr:Q", format=".2f", title="전장 하한"), alt.Tooltip("rate:Q", format=".1f", title="합격률(%)"),
+                    tooltip=[alt.Tooltip("thr:Q", format=".2f", title="X 하한"), alt.Tooltip("rate:Q", format=".1f", title="합격률(%)"),
                              alt.Tooltip("n:Q", title="남은 시료 수")])
                 layers = [cl, alt.Chart(pd.DataFrame({"y": [target_pct], "kind": ["목표"]})).mark_rule(strokeDash=[6, 4], strokeWidth=1.8).encode(
                     y="y:Q", color=alt.Color("kind:N", scale=_line_color_scale(), legend=None))]
                 if rec is not None:
-                    layers.append(alt.Chart(pd.DataFrame({"x": [rec["전장 하한"]], "kind": ["기준값"]})).mark_rule(strokeWidth=2).encode(
+                    layers.append(alt.Chart(pd.DataFrame({"x": [rec["X 하한"]], "kind": ["기준값"]})).mark_rule(strokeWidth=2).encode(
                         x="x:Q", color=alt.Color("kind:N", scale=_line_color_scale(), legend=None)))
                 st.altair_chart(_dark(alt.layer(*layers), 320), use_container_width=True, theme=None)
 
@@ -2014,15 +2029,15 @@ with tab_analysis:
             show = table.drop(columns=["구간 시작", "구간 끝"])
             cfg = {c: st.column_config.NumberColumn(format="%.1f") for c in show.columns if c.endswith("(%)")}
             st.dataframe(show, use_container_width=True, hide_index=True, column_config=cfg)
-            st.caption("권장 전장 하한은 '이 값 이상으로 관리하면 합격률이 목표에 도달한다'는 통계적 경향입니다. "
-                       "전장은 규격(공차)이 없는 관리 변수이므로, 다른 품질 항목과의 균형은 공정 담당자가 함께 판단하세요.")
+            st.caption("권장 X 하한은 '이 값 이상으로 관리하면 합격률이 목표에 도달한다'는 통계적 경향입니다. "
+                       "X은 규격(공차)이 없는 관리 변수이므로, 다른 품질 항목과의 균형은 공정 담당자가 함께 판단하세요.")
         with st.expander("공정능력 (Cpk)", expanded=False):
             data, choice = _pick_dataset(r, "cap_dataset")
             if choice == "스펙 합격 시료":
                 st.warning("합격 시료만으로 계산하면 규격 밖 시료가 이미 제외돼 있어 능력이 실제보다 좋게 나옵니다. "
                            "공정능력은 '전체 유효 시료' 기준을 우선 보세요.")
-            st.caption("규격(상한)이 있는 타겟 항목(단축·장축 위치도, 단축 윤곽도)만 계산합니다. "
-                       "전장·일자-Y 는 규격이 없는 관리 변수라서 공정능력 대상이 아닙니다 (분포·상관·관리도 탭에서 분석).")
+            st.caption(f"규격이 있는 타겟 항목({', '.join(r['specs'])})만 계산합니다. "
+                       "X·Y 는 규격이 없는 관리 변수라서 공정능력 대상이 아닙니다 (분포·상관·관리도 탭에서 분석).")
 
             rows = []
             for k, (lo, hi) in r["specs"].items():
@@ -2030,24 +2045,24 @@ with tab_analysis:
                 lsl = lo if lo > 0 else None  # 0 은 물리적 하한이므로 규격 하한으로 보지 않는다 (한쪽 규격)
                 c = capability(data[k], lsl, hi)
                 rows.append({
-                    "항목": k, "규격(상한)": f"{hi:g}" if lsl is None else f"{lsl:g} ~ {hi:g}", "시료 수": c["n"],
-                    "평균": c["mean"], "표준편차": c["std"], "Cpk(정규, Cpu)": c["cpk"], "Cpk(백분위)": c["cpk_pct"],
+                    "항목": k, "규격": f"≤ {hi:g} (한쪽)" if lsl is None else f"{lsl:g} ~ {hi:g} (양쪽)", "시료 수": c["n"],
+                    "평균": c["mean"], "표준편차": c["std"], "Cp": c["cp"], "Cpk(정규)": c["cpk"], "Cpk(백분위)": c["cpk_pct"],
                     "판정(Cpk 기준)": cap_rating(c["cpk"]), "예상 불량 PPM(정규)": c["ppm"], "실측 규격 밖": c["n_out"],
                 })
             cap_df = pd.DataFrame(rows)
 
             st.markdown('<div class="block-title">① 타겟 항목별 공정능력</div>', unsafe_allow_html=True)
             cfg = {c: st.column_config.NumberColumn(format="%.3f") for c in ("평균", "표준편차")}
-            cfg.update({c: st.column_config.NumberColumn(format="%.2f") for c in ("Cpk(정규, Cpu)", "Cpk(백분위)")})
+            cfg.update({c: st.column_config.NumberColumn(format="%.2f") for c in ("Cp", "Cpk(정규)", "Cpk(백분위)")})
             cfg["예상 불량 PPM(정규)"] = st.column_config.NumberColumn(format="%.0f")
             st.dataframe(cap_df, use_container_width=True, hide_index=True, column_config=cfg)
 
-            plot = cap_df.dropna(subset=["Cpk(정규, Cpu)"])
+            plot = cap_df.dropna(subset=["Cpk(정규)"])
             if not plot.empty:
                 st.markdown('<div class="block-title">② Cpk 비교 (기준선: 1.00 / 1.33 / 1.67)</div>', unsafe_allow_html=True)
                 cb = alt.Chart(plot).mark_bar(color=ACCENT_BLUE).encode(
-                    x=alt.X("항목:N", sort=None, title=None, axis=alt.Axis(labelAngle=0)), y=alt.Y("Cpk(정규, Cpu):Q", title="Cpk"),
-                    tooltip=[alt.Tooltip("항목:N"), alt.Tooltip("Cpk(정규, Cpu):Q", format=".2f", title="Cpk"),
+                    x=alt.X("항목:N", sort=None, title=None, axis=alt.Axis(labelAngle=0)), y=alt.Y("Cpk(정규):Q", title="Cpk"),
+                    tooltip=[alt.Tooltip("항목:N"), alt.Tooltip("Cpk(정규):Q", format=".2f", title="Cpk"),
                              alt.Tooltip("판정(Cpk 기준):N", title="판정")])
                 ref = pd.DataFrame({"y": [1.0, 1.33, 1.67], "kind": ["LSL", "기준값", "목표"]})
                 rl = alt.Chart(ref).mark_rule(strokeDash=[6, 4], strokeWidth=1.6).encode(
@@ -2055,8 +2070,8 @@ with tab_analysis:
                 st.altair_chart(_dark(alt.layer(cb, rl), 300), use_container_width=True, theme=None)
 
             st.caption(
-                "위치도·윤곽도는 0 이하로 내려갈 수 없는 한쪽(상한) 규격이라 Cp 는 없고 Cpk = Cpu = (USL−μ) / 3σ 만 계산합니다 (σ = 전체 표본 표준편차). "
-                "분포가 0 쪽으로 몰려 한쪽으로 치우쳐 있어, 정규분포 가정 Cpk 와 백분위 방식 Cpk(중앙값에서 99.865% 점까지 거리 기준)를 함께 보여줍니다. "
+                "위치도·윤곽도처럼 0 이하로 내려갈 수 없는 한쪽(상한) 규격은 Cp 없이 Cpk = Cpu = (USL−μ) / 3σ 만 계산하고, 케이스 각도처럼 양쪽 규격은 Cp 와 Cpk 를 모두 계산합니다 (σ = 전체 표본 표준편차). "
+                "위치도·윤곽도는 분포가 0 쪽으로 몰려 한쪽으로 치우쳐 있어, 정규분포 가정 Cpk 와 백분위 방식 Cpk(중앙값에서 99.865% 점까지 거리 기준)를 함께 보여줍니다. "
                 "예상 불량 PPM 은 정규분포 가정 값이라 치우친 분포에서는 실측 규격 밖 수와 차이가 날 수 있습니다.")
         with st.expander("분포 분석", expanded=False):
             data, choice = _pick_dataset(r, "dist_dataset")
@@ -2080,7 +2095,7 @@ with tab_analysis:
                 st.caption(f"히스토그램은 '{choice}' 기준이며, 파란 선은 같은 평균·표준편차의 정규분포입니다. "
                            "박스플롯은 전체와 합격 시료를 비교합니다 (상자: 25~75%, 가운데 선: 중앙값).")
                 if sel in r["var_keys"]:
-                    st.caption("전장·일자-Y 는 규격(공차)이 없는 관리 변수라 초록 점선은 엑셀 머리글의 기준값(참고용)입니다.")
+                    st.caption("X·Y 는 규격(공차)이 없는 관리 변수라 초록 점선은 엑셀 머리글의 기준값(참고용)입니다.")
             else:
                 st.info("시료가 너무 적어 그래프를 그릴 수 없습니다.")
         with st.expander("상관 · 산점도", expanded=False):
@@ -2113,7 +2128,7 @@ with tab_analysis:
                 m2.markdown(_kpi("결정계수 R²", f"{rr ** 2:.3f}", "X 로 설명되는 Y 변동 비율"), unsafe_allow_html=True)
                 m3.markdown(_kpi("회귀 기울기", f"{slope:.4f}", f"{x_item} 1 증가 시 {y_item} {slope:+.4f}"), unsafe_allow_html=True)
                 st.altair_chart(scatter_chart(sdf, x_item, y_item, slope, intercept), use_container_width=True, theme=None)
-                st.caption("점 색은 3개 타겟 스펙을 모두 만족했는지(합격/불합격)입니다. 흰 점선은 단순 선형 회귀선입니다.")
+                st.caption("점 색은 모든 타겟 스펙을 만족했는지(합격/불합격)입니다. 흰 점선은 단순 선형 회귀선입니다.")
         with st.expander("런차트 · 관리도", expanded=False):
             df_all, items = r["df"], _analysis_items(r)
             i1, i2 = st.columns([2, 1])
@@ -2218,25 +2233,26 @@ if tab_sync is not None:
 if tab_help is not None:
   with tab_help:
     st.markdown("""
-- **계산 기준**: 타겟 항목 3개(단축 위치도 0~1.0, 장축 위치도 0~1.0, 단축 윤곽도 0~0.8, 경계 포함)를 **모두 동시에** 만족하면 합격입니다.
+- **계산 기준**: 타겟 항목 4개(단축 위치도 0~1.0, 장축 위치도 0~1.0, 단축 윤곽도 0~0.8, 케이스 각도 8.17~9.37, 경계 포함)를 **모두 동시에** 만족하면 합격입니다.
+  입력(조건) 변수는 X(옛 이름 X)와 Y(옛 이름 Y)입니다. 케이스 각도는 엑셀 값이 -9.38 처럼 음수로 기록돼 있어 크기(절댓값)로 스펙과 비교합니다 (Tab 1 스펙 입력의 체크박스로 끌 수 있음).
   타겟 스펙 값은 Tab 1 상단에서 바꿀 수 있습니다.
-- **최종 Min/Max (Tab 1 ①)**: 시료를 하나씩 보고 3개 타겟 스펙을 모두 만족하면 OK 로 분류한 뒤, OK 시료 전체에서 전장·일자-Y 의 가장 작은 값과
+- **최종 Min/Max (Tab 1 ①)**: 시료를 하나씩 보고 모든 타겟 스펙을 만족하면 OK 로 분류한 뒤, OK 시료 전체에서 X·Y 의 가장 작은 값과
   가장 큰 값을 구합니다. OK 시료는 전부 이 범위 안에 들어옵니다. 반대로 이 범위 안에 들어온 시료가 전부 OK 인 것은 아닙니다.
-- **양 끝단 포함 전장 (Tab 1 ②)**: 전장은 양쪽 끝단 '중심' 사이의 거리(휨 X − 일자 X)이고, 끝단 파이프는 기울어져 있어 원주 8점의 Y 값이 서로 다릅니다.
-  그래서 지그를 만들 때는 전장에 기울어서 튀어나온 길이를 더해야 제품이 들어갑니다. 합격(OK) 시료마다 (오른쪽 끝단 Y-값_장1~8 중 가장 큰 값) − (왼쪽 끝단 Y-값_단1~8 중 가장 작은 값)을
-  '양 끝단 포함 전장'으로 계산하고, 그 최소·최대를 보여줍니다. '안쪽 전장'(양 끝단이 가장 가까워지는 길이)과 기울기로 늘어난 길이도 함께 나옵니다.
-- **합격 보장 범위 (Tab 1 ④ 참고, Tab 4 게이지 설계)**: 전장 범위와 일자-Y 범위를 **동시에** 만족하면 3개 타겟 스펙을 모두 만족하도록, 불합격 시료가 하나도 포함되지
+- **양 끝단 포함 X (Tab 1 ②)**: X 는 양쪽 끝단 '중심' 사이의 거리(장축 거리 − 단축 거리)이고, 끝단 파이프는 기울어져 있어 원주 8점의 Y 값이 서로 다릅니다.
+  그래서 지그를 만들 때는 X에 기울어서 튀어나온 길이를 더해야 제품이 들어갑니다. 합격(OK) 시료마다 (오른쪽(장축) 끝단 장축 파이프 기울기 1~8 중 가장 큰 값) − (왼쪽(단축) 끝단 단축 파이프 기울기 1~8 중 가장 작은 값)을
+  '양 끝단 포함 X'으로 계산하고, 그 최소·최대를 보여줍니다. '안쪽 X'(양 끝단이 가장 가까워지는 길이)과 기울기로 늘어난 길이도 함께 나옵니다.
+- **합격 보장 범위 (Tab 1 ④ 참고, Tab 4 게이지 설계)**: X 범위와 Y 범위를 **동시에** 만족하면 모든 타겟 스펙을 만족하도록, 불합격 시료가 하나도 포함되지
   않는 직사각형 범위 중 합격 시료를 가장 많이 포함하는 범위를 정확히 찾습니다. 이번 데이터에서 실제 측정된 시료 기준이라 시료가 늘면 범위가 바뀔 수 있고,
   측정하지 않은 다른 요인의 영향은 반영되지 않습니다.
-- **Tab 2 (조건 찾기)**: 전장·일자-Y 를 입력, 위치도 2종·윤곽도를 결과로 보고 이번 데이터의 경향으로 '3개 스펙을 만족하려면 입력을 어떻게 맞춰야 하는지'를 찾습니다.
-  ① 예측 정확도(교차검증 오차 RMSE, 설명력 R², OK/NG 판정 정확도, 확률 보정), ② 3개 스펙을 만족할 확률이 목표(기본 90%) 이상이면서 실측 근거 시료가 충분한 입력 구간(추천 작업 구간)과
+- **Tab 2 (조건 찾기)**: X·Y 를 입력, 타겟(위치도 2종·윤곽도·케이스 각도)을 결과로 보고 이번 데이터의 경향으로 '모든 타겟 스펙을 만족하려면 입력을 어떻게 맞춰야 하는지'를 찾습니다.
+  ① 예측 정확도(교차검증 오차 RMSE, 설명력 R², OK/NG 판정 정확도, 확률 보정), ② 모든 타겟 스펙을 만족할 확률이 목표(기본 90%) 이상이면서 실측 근거 시료가 충분한 입력 구간(추천 작업 구간)과
   OK 확률 지도, ③ 현재 NG 시료의 입력을 얼마나 바꾸면 스펙 안에 들어가는지(변경 한도·안전 여유·우선순위 설정 가능)를 보여줍니다.
   이 데이터는 이미 만들어진 시료를 측정한 관측 데이터라서 원인-결과가 확정된 것이 아니므로, 추천 조건은 시험 시료로 확인해야 합니다.
-- **전장 기준 선택 (Tab 2, Tab 4)**: 두 탭 맨 위의 '전장 기준'에서 '양 끝단 포함 전장'을 고르면 전장 대신 양 끝단(파이프 기울기)을 포함한 전장으로 조건 찾기와 게이지 설계를 합니다. 지그 치수는 이 기준으로 만들어야 합니다.
-- **Tab 3 (시료 확인)**: 스펙을 모두 만족한 시료 전체 표(전장 오름차순)와 엑셀 머리글에서 인식한 열 정보를 함께 보여줍니다.
-- **Tab 4 (Go/No-Go 게이지 설계)**: ① 허용 불합격률(0~5%)별로 전장·일자-Y 범위를 비교하고, ② 게이지 제작 공차와 마모 여유를 안쪽으로 반영해 GO/NO-GO 설계 치수를 계산하고,
+- **X 기준 선택 (Tab 2, Tab 4)**: 두 탭 맨 위의 'X 기준'에서 '양 끝단 포함 X'을 고르면 X 대신 양 끝단(파이프 기울기)을 포함한 X으로 조건 찾기와 게이지 설계를 합니다. 지그 치수는 이 기준으로 만들어야 합니다.
+- **Tab 3 (시료 확인)**: 스펙을 모두 만족한 시료 전체 표(X 오름차순)와 엑셀 머리글에서 인식한 열 정보를 함께 보여줍니다.
+- **Tab 4 (Go/No-Go 게이지 설계)**: ① 허용 불합격률(0~5%)별로 X·Y 범위를 비교하고, ② 게이지 제작 공차와 마모 여유를 안쪽으로 반영해 GO/NO-GO 설계 치수를 계산하고,
   ③ 그 게이지로 이번 시료를 판정한 결과(통과·유출·양품 NG)를 보여줍니다. 측정 불확도와 온도 영향은 반영하지 않습니다.
-- **Tab 5 (품질 분석)**: 5개 아코디언(기본은 닫힘) — 전장 구간별 합격률, 공정능력(Cpk, 규격이 있는 타겟 3개만), 분포 분석, 상관·산점도, 런차트·관리도.
+- **Tab 5 (품질 분석)**: 5개 아코디언(기본은 닫힘) — X 구간별 합격률, 공정능력(Cp/Cpk, 규격이 있는 타겟만), 분포 분석, 상관·산점도, 런차트·관리도.
   주의: 이 엑셀은 행이 단축 윤곽도 오름차순으로 정렬되어 있어서, 런차트·관리도의 '엑셀 행 순서' 경향은 생산 순서가 아니라 정렬 때문일 수 있습니다.
 - **제외되는 행**: 엑셀 하단의 `MIN / MAX / AVG`, `0.8 미만`, `0.8 이상`, `합격 / 불합격` 같은 요약·구분 행은 시료가 아니므로
   파일명 패턴(기본 `.xls` 또는 `QMS` 포함)으로 걸러냅니다.
