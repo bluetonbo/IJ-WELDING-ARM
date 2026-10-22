@@ -1202,6 +1202,142 @@ def adjust_arrow_chart(cur, rec):
 
 
 # ============================================================
+# 1-4. 고정 조건에서 OK 가 되는 X · Y 범위 예측 (예: 지그로 케이스 각도를 한 값으로 고정)
+#   - 고정할 타겟(w)을 입력처럼 취급해, 나머지 타겟 결과를 (X, Y, w) 로 예측한다 (X, Y 2차 + w 1·2차 + w×X, w×Y)
+#   - 고정값이 그 타겟의 스펙 안이면 그 타겟은 만족한 것으로 보고, 나머지 타겟이 모두 스펙 안일 확률(잔차 재표본)을 구한다
+#   - '근거 시료'는 w 가 고정값 ± dw 안인 시료 중 (X, Y) 가 가까운 것만 센다
+# ============================================================
+
+def _feat_fixed(xv, yv, wv, norm):
+    mx, my, mw, sx, sy, sw = norm
+    u = (np.asarray(xv, dtype=float) - mx) / sx
+    v = (np.asarray(yv, dtype=float) - my) / sy
+    z = (np.asarray(wv, dtype=float) - mw) / sw
+    return np.column_stack([np.ones_like(u), u, v, u * u, v * v, u * v, z, z * u, z * v, z * z])
+
+
+def fit_fixed_model(x, y, w, tm):
+    x, y, w, tm = (np.asarray(a, dtype=float) for a in (x, y, w, tm))
+    norm = (float(x.mean()), float(y.mean()), float(w.mean()), float(x.std()) or 1.0, float(y.std()) or 1.0, float(w.std()) or 1.0)
+    X = _feat_fixed(x, y, w, norm)
+    beta, *_ = np.linalg.lstsq(X, tm, rcond=None)
+    return {"norm": norm, "beta": beta, "resid": tm - X @ beta}
+
+
+def pok_fixed(model, xs, ys, a_fix, lo, hi):
+    """고정값 a_fix 에서 (xs, ys) 조건의 '나머지 타겟이 모두 스펙 안'일 확률."""
+    lo, hi = np.asarray(lo, float), np.asarray(hi, float)
+    xs, ys = np.ravel(xs), np.ravel(ys)
+    pred = _feat_fixed(xs, ys, np.full(len(xs), a_fix), model["norm"]) @ model["beta"]
+    resid = model["resid"]
+    out = np.empty(len(pred))
+    for s0 in range(0, len(pred), 400):
+        blk = pred[s0:s0 + 400]
+        ok = np.ones((len(blk), len(resid)), dtype=bool)
+        for t in range(blk.shape[1]):
+            v = blk[:, t][:, None] + resid[None, :, t]
+            ok &= (v >= lo[t]) & (v <= hi[t])
+        out[s0:s0 + 400] = ok.mean(axis=1)
+    return out
+
+
+def _grid(lim, step):
+    return np.round(np.arange(np.ceil(lim[0] / step - 1e-9) * step, lim[1] + 1e-9, step), 6)
+
+
+def _support_counts(gx, gy, x, y, near_w, wx, wy):
+    GX, GY = np.meshgrid(gx, gy, indexing="ij")
+    fx, fy = GX.ravel(), GY.ravel()
+    xs, ys = x[near_w], y[near_w]
+    cnt = np.zeros(len(fx), dtype=int)
+    for s0 in range(0, len(fx), 800):
+        cnt[s0:s0 + 800] = ((np.abs(fx[s0:s0 + 800, None] - xs[None, :]) <= wx + 1e-9) &
+                            (np.abs(fy[s0:s0 + 800, None] - ys[None, :]) <= wy + 1e-9)).sum(axis=1)
+    return cnt.reshape(GX.shape)
+
+
+@st.cache_data(show_spinner=False)
+def fixed_condition_analysis(x, y, w, tm, lo, hi, a_fix, xlim, ylim, dw, wx, wy, min_n, probs=(0.9, 0.8, 0.7), step=0.02):
+    """고정값 a_fix 에서 목표 OK 확률(probs)별 X·Y 직사각형 범위, 최고 확률 조건, 고정값 구간별 OK 비율."""
+    x, y, w, tm = (np.asarray(a, dtype=float) for a in (x, y, w, tm))
+    lo, hi = np.asarray(lo, float), np.asarray(hi, float)
+    model = fit_fixed_model(x, y, w, tm)
+    gx, gy = _grid(xlim, step), _grid(ylim, step)
+    GX, GY = np.meshgrid(gx, gy, indexing="ij")
+    P = pok_fixed(model, GX.ravel(), GY.ravel(), a_fix, lo, hi).reshape(GX.shape)
+    near_w = np.abs(w - a_fix) <= dw
+    cnt = _support_counts(gx, gy, x, y, near_w, wx, wy)
+    sup = cnt >= min_n
+    ok_other = np.all((tm >= lo) & (tm <= hi), axis=1)
+
+    rects = []
+    for p in probs:
+        rc = max_rect(sup & (P >= p))
+        row = {"목표 OK 확률(%)": p * 100, "rect": None}
+        if rc is not None:
+            i0, i1, j0, j1 = rc
+            xr, yr = (float(gx[i0]), float(gx[i1])), (float(gy[j0]), float(gy[j1]))
+            inside = (x >= xr[0]) & (x <= xr[1]) & (y >= yr[0]) & (y <= yr[1])
+            m_near = inside & near_w
+            row.update({"rect": {"x": xr, "y": yr}, "p_min": float(P[i0:i1 + 1, j0:j1 + 1].min()),
+                        "n_near": int(m_near.sum()), "ok_near": int(ok_other[m_near].sum()),
+                        "n_all": int(inside.sum()), "ok_all": int(ok_other[inside].sum())})
+        rects.append(row)
+
+    best = None
+    if sup.any():
+        Pm = np.where(sup, P, -1.0)
+        bi = np.unravel_index(int(np.argmax(Pm)), P.shape)
+        cx, cy = float(gx[bi[0]]), float(gy[bi[1]])
+        m = near_w & (np.abs(x - cx) <= wx) & (np.abs(y - cy) <= wy)
+        best = {"x": cx, "y": cy, "p": float(P[bi]), "n": int(cnt[bi]), "ok": int(ok_other[m].sum())}
+
+    edges = np.linspace(w.min(), w.max(), 7)
+    bins = []
+    for a, b in zip(edges[:-1], edges[1:]):
+        m = (w >= a) & (w <= b if b == edges[-1] else w < b)
+        if m.any():
+            bins.append({"구간": f"{a:.3f} ~ {b:.3f}", "시료 수": int(m.sum()), "나머지 타겟 OK 비율(%)": float(ok_other[m].mean() * 100),
+                         "_lo": float(a), "_hi": float(b)})
+    return {"gx": gx, "gy": gy, "P": P, "cnt": cnt, "step": step, "rects": rects, "best": best,
+            "n_near": int(near_w.sum()), "ok_near": int(ok_other[near_w].sum()), "bins": pd.DataFrame(bins)}
+
+
+@st.cache_data(show_spinner=False)
+def fixed_sweep(x, y, w, tm, lo, hi, values, xlim, ylim, dw, wx, wy, min_n, step=0.02):
+    """고정값을 바꿔 가며 달성 가능한 최고 OK 확률(근거 시료가 있는 X·Y 중)을 비교한다."""
+    x, y, w, tm = (np.asarray(a, dtype=float) for a in (x, y, w, tm))
+    lo, hi = np.asarray(lo, float), np.asarray(hi, float)
+    model = fit_fixed_model(x, y, w, tm)
+    gx, gy = _grid(xlim, step), _grid(ylim, step)
+    GX, GY = np.meshgrid(gx, gy, indexing="ij")
+    rows = []
+    for a in values:
+        cnt = _support_counts(gx, gy, x, y, np.abs(w - a) <= dw, wx, wy)
+        sup = cnt >= min_n
+        if not sup.any():
+            rows.append({"고정값": float(a), "최고 OK 확률(%)": np.nan, "X": np.nan, "Y": np.nan, "근거 시료 수": 0})
+            continue
+        P = pok_fixed(model, GX.ravel(), GY.ravel(), a, lo, hi).reshape(GX.shape)
+        bi = np.unravel_index(int(np.argmax(np.where(sup, P, -1.0))), P.shape)
+        rows.append({"고정값": float(a), "최고 OK 확률(%)": float(P[bi] * 100), "X": float(gx[bi[0]]), "Y": float(gy[bi[1]]), "근거 시료 수": int(cnt[bi])})
+    return pd.DataFrame(rows)
+
+
+def build_fixed_xlsx(range_df, bins_df, sweep_df, params) -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as w:
+        range_df.to_excel(w, sheet_name="OK 확률별 X·Y 범위", index=False)
+        bins_df.to_excel(w, sheet_name="고정값 구간별 OK 비율", index=False)
+        sweep_df.to_excel(w, sheet_name="고정값별 최고 OK 확률", index=False)
+        pd.DataFrame(list(params.items()), columns=["조건", "값"]).to_excel(w, sheet_name="분석 조건", index=False)
+        for ws in w.book.worksheets:
+            for idx, col in enumerate(ws.iter_cols(min_row=1, max_row=1), start=1):
+                ws.column_dimensions[get_column_letter(idx)].width = max(14, len(str(col[0].value or "")) + 4)
+    return bio.getvalue()
+
+
+# ============================================================
 # 2. UI (원본과 동일한 로그인 → 사이드바 입력 → 상단 탭 구조)
 # ============================================================
 login_gate()
@@ -1536,7 +1672,7 @@ with tab_main:
             _inbox = res["df"][_xk].between(vals.loc[_xk, "Min"], vals.loc[_xk, "Max"]) & res["df"][_yk].between(vals.loc[_yk, "Min"], vals.loc[_yk, "Max"])
             st.caption(
                 f"참고: 반대로, 이 두 범위에 동시에 들어오는 시료는 {int(_inbox.sum())}개이고 그 중 {int((~_flags[_inbox.values]).sum())}개는 스펙을 만족하지 못한 시료입니다. "
-                "즉 이 범위는 '합격 시료가 존재했던 폭'이며, 범위 안이라고 해서 합격이 보장되지는 않습니다 (보장되는 범위는 아래 ④ 참고).")
+                "즉 이 범위는 '합격 시료가 존재했던 폭'이며, 범위 안이라고 해서 합격이 보장되지는 않습니다 (보장되는 범위는 아래 ⑤ 참고).")
             num_cfg = {c: st.column_config.NumberColumn(format="%.4f") for c in ("Min", "Max", "Max-Min")}
             st.dataframe(summary, use_container_width=True, hide_index=True, column_config=num_cfg)
 
@@ -1590,7 +1726,108 @@ with tab_main:
         stat_cfg["단독 합격률(%)"] = st.column_config.NumberColumn(format="%.1f")
         st.dataframe(status_df, use_container_width=True, hide_index=True, column_config=stat_cfg)
 
-        with st.expander("④ 참고 · 이 범위 안이면 반드시 합격인 더 좁은 범위 (불합격 0개, Go/No-Go 게이지용)", expanded=False):
+        if n_in:
+            st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+            st.markdown('<div class="block-title">④ 고정 조건에서 OK 가 되는 X · Y 범위 (예측) — 예: 케이스 각도를 지그로 한 값에 고정</div>', unsafe_allow_html=True)
+            _tg = list(res["specs"])
+            _dfx = res["df"]
+            _xk, _yk = res["var_keys"][0], res["var_keys"][1]
+            _fx_t = st.selectbox("고정할 타겟 (지그로 값을 한 값으로 정하는 항목)", _tg,
+                                 index=_tg.index("케이스 각도") if "케이스 각도" in _tg else 0, key="fix4_target")
+            _others = [k for k in _tg if k != _fx_t]
+            _fx_mean = float(status_df.loc[status_df["타겟 항목"] == _fx_t, "OK 시료 평균"].iloc[0])
+            f1, f2, f3, f4 = st.columns(4)
+            _fx_val = f1.number_input(f"{_fx_t} 고정값", value=round(_fx_mean, 4), step=0.01, format="%.4f",
+                                      key=f"fix4_val_{_fx_t}_{round(_fx_mean, 4)}", help="기본값은 합격(OK) 시료의 평균입니다.")
+            _fx_dw = f2.number_input(f"근거 시료 폭 ± ({_fx_t})", min_value=0.001, value=max(0.001, round(0.6 * float(_dfx[_fx_t].std()), 3)),
+                                     step=0.01, format="%.3f", key=f"fix4_dw_{_fx_t}",
+                                     help="고정값에서 이 폭 안에 있는 실제 시료만 '근거 시료'로 셉니다.")
+            _fx_n = f3.number_input("최소 근거 시료 수", min_value=1, max_value=500, value=20, step=5, key="fix4_minn",
+                                    help="X·Y 조건 주변에 근거 시료가 이만큼 이상 있는 곳만 추천합니다.")
+            _fx_win = f4.number_input("X·Y 근거 창 ± (mm)", min_value=0.01, max_value=0.5, value=0.05, step=0.01, format="%.2f", key="fix4_win")
+            _sp = res["specs"][_fx_t]
+            if not (min(_sp) <= _fx_val <= max(_sp)):
+                st.warning(f"고정값 {_fx_val:g} 은 {_fx_t} 스펙({min(_sp):g} ~ {max(_sp):g}) 밖이라 이 타겟은 항상 NG 가 됩니다. 아래 결과는 나머지 타겟만 기준으로 한 값입니다.")
+
+            _xa, _ya = _dfx[_xk].to_numpy(dtype=float), _dfx[_yk].to_numpy(dtype=float)
+            _wa = _dfx[_fx_t].to_numpy(dtype=float)
+            _tm_o = _dfx[_others].to_numpy(dtype=float)
+            _lo_o = np.array([min(res["specs"][k]) for k in _others])
+            _hi_o = np.array([max(res["specs"][k]) for k in _others])
+            _xlim, _ylim = (float(_xa.min()), float(_xa.max())), (float(_ya.min()), float(_ya.max()))
+            fa = fixed_condition_analysis(_xa, _ya, _wa, _tm_o, _lo_o, _hi_o, float(_fx_val), _xlim, _ylim,
+                                          float(_fx_dw), float(_fx_win), float(_fx_win), int(_fx_n))
+            _best = fa["best"]
+            g1, g2, g3, g4 = st.columns(4)
+            g1.markdown(_kpi(f"{_fx_t} 고정값", f"{_fx_val:.4f}", "스펙 안" if min(_sp) <= _fx_val <= max(_sp) else "스펙 밖", color=SUCCESS if min(_sp) <= _fx_val <= max(_sp) else WARNING), unsafe_allow_html=True)
+            _nn = fa["n_near"]
+            g2.markdown(_kpi("고정값 근처 실측 시료", f"{_nn}개", f"나머지 타겟 OK {fa['ok_near']}개 ({fa['ok_near'] / _nn * 100:.1f}%)" if _nn else "근거 없음"), unsafe_allow_html=True)
+            if _best is not None:
+                g3.markdown(_kpi("최고 OK 확률 조건 (모델)", f"{_best['p'] * 100:.1f}%", f"{_xk} {_best['x']:.2f} · {_yk} {_best['y']:.2f}", color=SUCCESS), unsafe_allow_html=True)
+                g4.markdown(_kpi("그 조건 주변 근거 시료", f"{_best['n']}개", f"나머지 타겟 OK {_best['ok']}개"), unsafe_allow_html=True)
+            else:
+                g3.markdown(_kpi("최고 OK 확률 조건 (모델)", "없음", "근거 시료가 부족합니다", color=WARNING), unsafe_allow_html=True)
+                g4.markdown(_kpi("그 조건 주변 근거 시료", "-"), unsafe_allow_html=True)
+
+            _rows = []
+            for rr in fa["rects"]:
+                if rr["rect"] is None:
+                    _rows.append({"목표 OK 확률(%)": rr["목표 OK 확률(%)"], f"{_xk} 범위": "구간 없음", f"{_yk} 범위": "-"})
+                else:
+                    _rows.append({"목표 OK 확률(%)": rr["목표 OK 확률(%)"],
+                                  f"{_xk} 범위": f"{rr['rect']['x'][0]:.2f} ~ {rr['rect']['x'][1]:.2f}",
+                                  f"{_yk} 범위": f"{rr['rect']['y'][0]:.2f} ~ {rr['rect']['y'][1]:.2f}",
+                                  "구간 안 최소 OK 확률(모델,%)": rr["p_min"] * 100,
+                                  f"구간 안 실측 시료({_fx_t} 근처)": rr["n_near"], "그 중 OK": rr["ok_near"],
+                                  "실측 OK 비율(%)": rr["ok_near"] / rr["n_near"] * 100 if rr["n_near"] else np.nan,
+                                  f"구간 안 실측 시료({_fx_t} 무관)": rr["n_all"],
+                                  "실측 OK 비율(전체,%)": rr["ok_all"] / rr["n_all"] * 100 if rr["n_all"] else np.nan})
+            range_df = pd.DataFrame(_rows)
+            _rcfg = {c: st.column_config.NumberColumn(format="%.1f") for c in range_df.columns if c.endswith("(%)") or c.endswith("(모델,%)") or c.endswith("(전체,%)")}
+            st.markdown('<div class="block-title" style="margin-top:12px;">고정값에서 OK 가 될 X · Y 범위 (모델 예측 + 실측 확인)</div>', unsafe_allow_html=True)
+            st.dataframe(range_df, use_container_width=True, hide_index=True, column_config=_rcfg)
+            st.caption(f"{_fx_t} 를 {_fx_val:g} 로 고정했을 때, 나머지 타겟({', '.join(_others)})이 모두 스펙 안일 확률이 목표 이상이면서 근거 시료가 충분한 "
+                       f"{_xk}·{_yk} 직사각형 범위입니다. '실측'은 {_fx_t} 가 고정값 ±{_fx_dw:g} 안인 실제 시료만 센 값이고, '무관'은 {_fx_t} 와 상관없이 그 X·Y 범위에 들어온 모든 시료입니다.")
+
+            _pick = st.radio("지도에 표시할 목표 OK 확률", [f"{r_['목표 OK 확률(%)']:.0f}%" for r_ in fa["rects"]], index=min(1, len(fa["rects"]) - 1), horizontal=True, key="fix4_pick")
+            _rect_map = fa["rects"][[f"{r_['목표 OK 확률(%)']:.0f}%" for r_ in fa["rects"]].index(_pick)]["rect"]
+            st.altair_chart(pok_heatmap(fa, int(_fx_n), _rect_map), use_container_width=True, theme=None)
+            st.caption(f"{_fx_t} = {_fx_val:g} 일 때 X·Y 조건별 OK 확률(모델)입니다. 회색 칸은 근거 시료가 부족한 곳, 흰색 사각형은 선택한 목표 확률의 추천 구간입니다.")
+
+            _bins = fa["bins"]
+            if len(_bins):
+                st.markdown(f'<div class="block-title" style="margin-top:12px;">{_fx_t} 구간별 OK 비율 (나머지 타겟 기준)</div>', unsafe_allow_html=True)
+                _bd = _bins.assign(고정값포함=[(_lo <= _fx_val <= _hi) for _lo, _hi in zip(_bins["_lo"], _bins["_hi"])])
+                _bch = alt.Chart(_bd.rename(columns={"나머지 타겟 OK 비율(%)": "rate", "시료 수": "n"})).mark_bar().encode(
+                    x=alt.X("구간:N", sort=None, title=f"{_fx_t} 구간", axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y("rate:Q", title="OK 비율 (%)", scale=alt.Scale(domain=[0, 105])),
+                    color=alt.Color("고정값포함:N", title="고정값이 속한 구간", scale=alt.Scale(domain=[True, False], range=[ACCENT_BLUE, "#4b5563"])),
+                    tooltip=[alt.Tooltip("구간:N"), alt.Tooltip("rate:Q", format=".1f", title="OK 비율(%)"), alt.Tooltip("n:Q", title="시료 수")])
+                st.altair_chart(_dark(_bch, 260), use_container_width=True, theme=None)
+                st.dataframe(_bins.drop(columns=["_lo", "_hi"]), use_container_width=True, hide_index=True,
+                             column_config={"나머지 타겟 OK 비율(%)": st.column_config.NumberColumn(format="%.1f")})
+                st.caption(f"고정값이 속한 구간(주황)의 OK 비율이 다른 구간보다 낮다면, 같은 X·Y 에서도 {_fx_t} 값에 따라 OK 가능성이 달라진다는 뜻입니다.")
+
+            _lo_fx, _hi_fx = float(min(_sp)), float(max(_sp))
+            _vals = np.linspace(_lo_fx, _hi_fx, 7) if _lo_fx > 0 else np.nanpercentile(_wa, np.linspace(5, 95, 7))
+            _vals = tuple(sorted(set(np.round(np.append(_vals, _fx_val), 4).tolist())))
+            sweep_df = fixed_sweep(_xa, _ya, _wa, _tm_o, _lo_o, _hi_o, _vals, _xlim, _ylim, float(_fx_dw), float(_fx_win), float(_fx_win), int(_fx_n))
+            sweep_df = sweep_df.rename(columns={"X": _xk, "Y": _yk})
+            st.markdown(f'<div class="block-title" style="margin-top:12px;">{_fx_t} 고정값별로 달성 가능한 최고 OK 확률 (근거 시료가 있는 X·Y 중)</div>', unsafe_allow_html=True)
+            st.dataframe(sweep_df, use_container_width=True, hide_index=True,
+                         column_config={"고정값": st.column_config.NumberColumn(format="%.4f"), "최고 OK 확률(%)": st.column_config.NumberColumn(format="%.1f"),
+                                        _xk: st.column_config.NumberColumn(format="%.2f"), _yk: st.column_config.NumberColumn(format="%.2f")})
+            st.caption("고정값을 바꿨을 때 최고 OK 확률이 얼마나 달라지는지 비교하는 표입니다. 근거 시료 수가 적은 행(20개 안팎)은 우연의 영향이 크니 시험 시료로 확인하세요. "
+                       "모델 예측이고 이미 만들어진 시료의 측정 데이터라서, 원인과 결과가 확정된 것은 아닙니다.")
+
+            _params = {"데이터 파일": res["file"], "고정 타겟": _fx_t, "고정값": _fx_val, "근거 시료 폭 ±": _fx_dw, "최소 근거 시료 수": int(_fx_n),
+                       "X·Y 근거 창 ±(mm)": _fx_win, "나머지 타겟": ", ".join(_others)}
+            st.download_button("고정조건_X_Y범위.xlsx 다운로드",
+                               data=build_fixed_xlsx(range_df, _bins.drop(columns=["_lo", "_hi"]) if len(_bins) else _bins, sweep_df, _params),
+                               file_name="고정조건_X_Y범위.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="fix4_dl")
+
+        with st.expander("⑤ 참고 · 이 범위 안이면 반드시 합격인 더 좁은 범위 (불합격 0개, Go/No-Go 게이지용)", expanded=False):
             if win is None:
                 st.warning("모든 타겟 스펙을 만족하는 시료가 없어 범위를 찾지 못했습니다.")
             else:
@@ -1895,7 +2132,7 @@ with tab_gauge:
             st.markdown('<div class="block-title">① 허용 불합격률별 범위 비교</div>', unsafe_allow_html=True)
             st.caption(f"{xk} 범위와 {yk} 범위를 동시에 만족하는 시료 중 불합격이 차지하는 비율을 일정 수준까지 허용했을 때, "
                        "범위가 얼마나 넓어지고 게이지 통과율이 얼마나 올라가는지 비교합니다. "
-                       "허용률 0% 는 불합격이 하나도 없는 범위(Tab 1 ④ 참고)입니다.")
+                       "허용률 0% 는 불합격이 하나도 없는 범위(Tab 1 ⑤ 참고)입니다.")
             rows = []
             for w in trade:
                 rows.append({
@@ -2257,7 +2494,10 @@ if tab_help is not None:
 - **양 끝단 포함 X (Tab 1 ②)**: X 는 양쪽 끝단 '중심' 사이의 거리(장축 거리 − 단축 거리)이고, 끝단 파이프는 기울어져 있어 원주 8점의 Y 값이 서로 다릅니다.
   그래서 지그를 만들 때는 X에 기울어서 튀어나온 길이를 더해야 제품이 들어갑니다. 합격(OK) 시료마다 (오른쪽(장축) 끝단 장축 파이프 기울기 1~8 중 가장 큰 값) − (왼쪽(단축) 끝단 단축 파이프 기울기 1~8 중 가장 작은 값)을
   '양 끝단 포함 X'으로 계산하고, 그 최소·최대를 보여줍니다. '안쪽 X'(양 끝단이 가장 가까워지는 길이)과 기울기로 늘어난 길이도 함께 나옵니다.
-- **합격 보장 범위 (Tab 1 ④ 참고, Tab 4 게이지 설계)**: X 범위와 Y 범위를 **동시에** 만족하면 모든 타겟 스펙을 만족하도록, 불합격 시료가 하나도 포함되지
+- **고정 조건 X·Y 범위 (Tab 1 ④)**: 지그로 한 타겟(기본 케이스 각도)을 한 값에 고정할 때, 그 값(기본 OK 시료 평균)에서 나머지 타겟이 모두 스펙 안일 확률이 목표(90/80/70%) 이상인 X·Y 범위를
+  모델로 예측하고(X·Y 2차 + 고정 타겟 1·2차 + 교차항, 잔차 재표본), 근거 시료 수와 실측 OK 비율로 확인합니다. 고정값 구간별 OK 비율, 고정값별 최고 OK 확률 비교도 함께 보여줍니다.
+  근거 시료가 적으면 우연의 영향이 크고 원인-결과가 확정된 것이 아니므로 시험 시료로 확인해야 합니다.
+- **합격 보장 범위 (Tab 1 ⑤ 참고, Tab 4 게이지 설계)**: X 범위와 Y 범위를 **동시에** 만족하면 모든 타겟 스펙을 만족하도록, 불합격 시료가 하나도 포함되지
   않는 직사각형 범위 중 합격 시료를 가장 많이 포함하는 범위를 정확히 찾습니다. 이번 데이터에서 실제 측정된 시료 기준이라 시료가 늘면 범위가 바뀔 수 있고,
   측정하지 않은 다른 요인의 영향은 반영되지 않습니다.
 - **Tab 2 (조건 찾기)**: X·Y 를 입력, 타겟(위치도 2종·윤곽도·케이스 각도)을 결과로 보고 이번 데이터의 경향으로 '모든 타겟 스펙을 만족하려면 입력을 어떻게 맞춰야 하는지'를 찾습니다.
