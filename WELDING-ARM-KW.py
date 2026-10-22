@@ -1271,9 +1271,23 @@ def fixed_condition_analysis(x, y, w, tm, lo, hi, a_fix, xlim, ylim, dw, wx, wy,
     ok_other = np.all((tm >= lo) & (tm <= hi), axis=1)
 
     rects = []
+    # 100%: 모델 확률은 잔차 때문에 100% 에 닿을 수 없으므로, '고정값 근처 근거 시료 중 NG 가 하나도 없는' X·Y 범위(OK 시료를 가장 많이 담는 직사각형)를 실측으로 찾는다
+    row100 = {"목표 OK 확률(%)": 100.0, "kind": "실측 (근거 시료 중 NG 0개)", "rect": None}
+    if near_w.any() and ok_other[near_w].any():
+        wnd = find_pass_window(pd.DataFrame({"x": x[near_w], "y": y[near_w]}), ok_other[near_w], "x", "y")
+        if wnd is not None:
+            xr, yr = wnd["x"], wnd["y"]
+            inside = (x >= xr[0]) & (x <= xr[1]) & (y >= yr[0]) & (y <= yr[1])
+            m_near = inside & near_w
+            pts_x = [xr[0], xr[1], xr[0], xr[1], (xr[0] + xr[1]) / 2]
+            pts_y = [yr[0], yr[0], yr[1], yr[1], (yr[0] + yr[1]) / 2]
+            p_min = float(pok_fixed(model, pts_x, pts_y, a_fix, lo, hi).min())  # 참고: 범위 모서리·중심에서의 모델 확률 최소값
+            row100.update({"rect": {"x": xr, "y": yr}, "p_min": p_min, "n_near": int(m_near.sum()), "ok_near": int(ok_other[m_near].sum()),
+                           "n_all": int(inside.sum()), "ok_all": int(ok_other[inside].sum())})
+    rects.append(row100)
     for p in probs:
-        rc = max_rect(sup & (P >= p))
-        row = {"목표 OK 확률(%)": p * 100, "rect": None}
+        rc = max_rect(sup & (P >= p - 1e-9))
+        row = {"목표 OK 확률(%)": p * 100, "kind": "모델 예측", "rect": None}
         if rc is not None:
             i0, i1, j0, j1 = rc
             xr, yr = (float(gx[i0]), float(gx[i1])), (float(gy[j0]), float(gy[j1]))
@@ -1772,11 +1786,14 @@ with tab_main:
             _rows = []
             for rr in fa["rects"]:
                 if rr["rect"] is None:
-                    _rows.append({"목표 OK 확률(%)": rr["목표 OK 확률(%)"], f"{_xk} 범위": "구간 없음", f"{_yk} 범위": "-"})
+                    _rows.append({"목표 OK 확률(%)": rr["목표 OK 확률(%)"], "기준": rr["kind"],
+                                  f"{_xk} 범위": ("구간 없음 (근거 시료 없음)" if rr["kind"].startswith("실측") else
+                                                  (f"구간 없음 (도달 가능한 최고 {_best['p'] * 100:.1f}%)" if _best is not None else "구간 없음 (근거 시료 부족)")),
+                                  f"{_yk} 범위": "-"})
                 else:
-                    _rows.append({"목표 OK 확률(%)": rr["목표 OK 확률(%)"],
-                                  f"{_xk} 범위": f"{rr['rect']['x'][0]:.2f} ~ {rr['rect']['x'][1]:.2f}",
-                                  f"{_yk} 범위": f"{rr['rect']['y'][0]:.2f} ~ {rr['rect']['y'][1]:.2f}",
+                    _rows.append({"목표 OK 확률(%)": rr["목표 OK 확률(%)"], "기준": rr["kind"],
+                                  f"{_xk} 범위": f"{rr['rect']['x'][0]:.4f} ~ {rr['rect']['x'][1]:.4f}" if rr["kind"].startswith("실측") else f"{rr['rect']['x'][0]:.2f} ~ {rr['rect']['x'][1]:.2f}",
+                                  f"{_yk} 범위": f"{rr['rect']['y'][0]:.4f} ~ {rr['rect']['y'][1]:.4f}" if rr["kind"].startswith("실측") else f"{rr['rect']['y'][0]:.2f} ~ {rr['rect']['y'][1]:.2f}",
                                   "구간 안 최소 OK 확률(모델,%)": rr["p_min"] * 100,
                                   f"구간 안 실측 시료({_fx_t} 근처)": rr["n_near"], "그 중 OK": rr["ok_near"],
                                   "실측 OK 비율(%)": rr["ok_near"] / rr["n_near"] * 100 if rr["n_near"] else np.nan,
@@ -1787,10 +1804,12 @@ with tab_main:
             st.markdown('<div class="block-title" style="margin-top:12px;">고정값에서 OK 가 될 X · Y 범위 (모델 예측 + 실측 확인)</div>', unsafe_allow_html=True)
             st.dataframe(range_df, use_container_width=True, hide_index=True, column_config=_rcfg)
             st.caption(f"{_fx_t} 를 {_fx_val:g} 로 고정했을 때, 나머지 타겟({', '.join(_others)})이 모두 스펙 안일 확률이 목표 이상이면서 근거 시료가 충분한 "
-                       f"{_xk}·{_yk} 직사각형 범위입니다. '실측'은 {_fx_t} 가 고정값 ±{_fx_dw:g} 안인 실제 시료만 센 값이고, '무관'은 {_fx_t} 와 상관없이 그 X·Y 범위에 들어온 모든 시료입니다.")
+                       f"{_xk}·{_yk} 직사각형 범위입니다. 100% 행은 모델이 아니라 실측 기준으로, {_fx_t} 가 고정값 ±{_fx_dw:g} 안인 근거 시료 중 NG 가 하나도 들어오지 않는 가장 큰 범위입니다. '실측'은 {_fx_t} 가 고정값 ±{_fx_dw:g} 안인 실제 시료만 센 값이고, '무관'은 {_fx_t} 와 상관없이 그 X·Y 범위에 들어온 모든 시료입니다.")
 
-            _pick = st.radio("지도에 표시할 목표 OK 확률", [f"{r_['목표 OK 확률(%)']:.0f}%" for r_ in fa["rects"]], index=min(1, len(fa["rects"]) - 1), horizontal=True, key="fix4_pick")
+            _pick = st.radio("지도에 표시할 목표 OK 확률", [f"{r_['목표 OK 확률(%)']:.0f}%" for r_ in fa["rects"]], index=([f"{r_['목표 OK 확률(%)']:.0f}%" for r_ in fa["rects"]].index("80%") if any(abs(r_["목표 OK 확률(%)"] - 80) < 1e-6 for r_ in fa["rects"]) else 0), horizontal=True, key="fix4_pick")
             _rect_map = fa["rects"][[f"{r_['목표 OK 확률(%)']:.0f}%" for r_ in fa["rects"]].index(_pick)]["rect"]
+            if _rect_map is None:
+                st.info(f"목표 {_pick} 에 도달하는 X·Y 구간이 없어 사각형 없이 지도만 표시합니다.")
             st.altair_chart(pok_heatmap(fa, int(_fx_n), _rect_map), use_container_width=True, theme=None)
             st.caption(f"{_fx_t} = {_fx_val:g} 일 때 X·Y 조건별 OK 확률(모델)입니다. 회색 칸은 근거 시료가 부족한 곳, 흰색 사각형은 선택한 목표 확률의 추천 구간입니다.")
 
@@ -2494,7 +2513,7 @@ if tab_help is not None:
 - **양 끝단 포함 X (Tab 1 ②)**: X 는 양쪽 끝단 '중심' 사이의 거리(장축 거리 − 단축 거리)이고, 끝단 파이프는 기울어져 있어 원주 8점의 Y 값이 서로 다릅니다.
   그래서 지그를 만들 때는 X에 기울어서 튀어나온 길이를 더해야 제품이 들어갑니다. 합격(OK) 시료마다 (오른쪽(장축) 끝단 장축 파이프 기울기 1~8 중 가장 큰 값) − (왼쪽(단축) 끝단 단축 파이프 기울기 1~8 중 가장 작은 값)을
   '양 끝단 포함 X'으로 계산하고, 그 최소·최대를 보여줍니다. '안쪽 X'(양 끝단이 가장 가까워지는 길이)과 기울기로 늘어난 길이도 함께 나옵니다.
-- **고정 조건 X·Y 범위 (Tab 1 ④)**: 지그로 한 타겟(기본 케이스 각도)을 한 값에 고정할 때, 그 값(기본 OK 시료 평균)에서 나머지 타겟이 모두 스펙 안일 확률이 목표(90/80/70%) 이상인 X·Y 범위를
+- **고정 조건 X·Y 범위 (Tab 1 ④)**: 지그로 한 타겟(기본 케이스 각도)을 한 값에 고정할 때, 그 값(기본 OK 시료 평균)에서 나머지 타겟이 모두 스펙 안일 확률이 목표(90/80/70%, 100%는 실측 NG 0개 기준) 이상인 X·Y 범위를
   모델로 예측하고(X·Y 2차 + 고정 타겟 1·2차 + 교차항, 잔차 재표본), 근거 시료 수와 실측 OK 비율로 확인합니다. 고정값 구간별 OK 비율, 고정값별 최고 OK 확률 비교도 함께 보여줍니다.
   근거 시료가 적으면 우연의 영향이 크고 원인-결과가 확정된 것이 아니므로 시험 시료로 확인해야 합니다.
 - **합격 보장 범위 (Tab 1 ⑤ 참고, Tab 4 게이지 설계)**: X 범위와 Y 범위를 **동시에** 만족하면 모든 타겟 스펙을 만족하도록, 불합격 시료가 하나도 포함되지
